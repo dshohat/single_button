@@ -23,8 +23,7 @@
 #include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8g2lib.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include <vector>
@@ -36,10 +35,8 @@
 #define OLED_SDA   21
 #define OLED_SCL   22
 
-// ===== Display =====
-#define SCREEN_W 128
-#define SCREEN_H 64
-Adafruit_SSD1306 oled(SCREEN_W, SCREEN_H, &Wire, -1);
+// ===== Display (U8g2 with Hebrew font) =====
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
 // ===== Constants =====
 static const char* AP_SSID    = "ESP32-Alert";
@@ -66,22 +63,24 @@ bool displayToggle = true;
 String mySSID;
 String myIP;
 std::vector<String> monitoredCities;
+String alertMatchCity;
 String scanResultsHTML;
+unsigned long lastDisplaySwitch = 0;
+int cityScrollOffset = 0;
+bool showCityList = false;
 
 // ===== Display helpers =====
 
 void show6(const char* a, const char* b = "", const char* c = "",
            const char* d = "", const char* e = "", const char* f = "") {
-    oled.clearDisplay();
-    oled.setTextSize(1);
-    oled.setTextColor(SSD1306_WHITE);
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_6x10_tf);
     const char* lines[] = {a, b, c, d, e, f};
     for (int i = 0; i < 6; i++) {
-        oled.setCursor(0, i * 10);
         String s = lines[i];
-        oled.print(s.substring(0, 21));
+        oled.drawStr(0, (i + 1) * 10, s.substring(0, 21).c_str());
     }
-    oled.display();
+    oled.sendBuffer();
 }
 
 // ===== Buzzer =====
@@ -118,9 +117,17 @@ void buzz(int ms, int freq) {
 }
 
 void siren() {
-    for (int f = 400; f < 900; f += 30) { buzzOn(f); delay(12); }
-    for (int f = 900; f > 400; f -= 30) { buzzOn(f); delay(12); }
-    buzzOff();
+    // Nokia ringtone melody in high pitch
+    int melody[] =  {2637,2637,0,2637,0,2093,2637,0,3136,0,0,0,1568,0,0,0};
+    int durations[]={120, 120,120,120,120,120, 120,120,120,120,120,240,120,120,120,240};
+    for (int i = 0; i < 16; i++) {
+        if (melody[i] > 0) {
+            buzz(durations[i], melody[i]);
+        } else {
+            delay(durations[i]);
+        }
+        delay(20);
+    }
 }
 
 void startupBeep() {
@@ -145,6 +152,30 @@ String urlEncode(const String& s) {
         }
     }
     return out;
+}
+
+// ===== Hebrew RTL helper =====
+
+String reverseUTF8(const String& s) {
+    std::vector<String> chars;
+    const uint8_t* p = (const uint8_t*)s.c_str();
+    int len = s.length();
+    int i = 0;
+    while (i < len) {
+        int charLen;
+        if (p[i] < 0x80) charLen = 1;
+        else if ((p[i] & 0xE0) == 0xC0) charLen = 2;
+        else if ((p[i] & 0xF0) == 0xE0) charLen = 3;
+        else if ((p[i] & 0xF8) == 0xF0) charLen = 4;
+        else { i++; continue; }
+        if (i + charLen > len) break;
+        chars.push_back(s.substring(i, i + charLen));
+        i += charLen;
+    }
+    String result;
+    for (int j = chars.size() - 1; j >= 0; j--)
+        result += chars[j];
+    return result;
 }
 
 // ===== Config I/O =====
@@ -246,11 +277,13 @@ void refreshMonitoredCities() {
         if (!refCities) continue;
 
         if (kv.value().is<const char*>() && String(kv.value().as<const char*>()) == "ALL") {
-            for (JsonVariant c : refCities)
+            for (JsonVariant c : refCities) {
                 monitoredCities.push_back(c.as<String>());
+            }
         } else if (kv.value().is<JsonArray>()) {
-            for (JsonVariant c : kv.value().as<JsonArray>())
+            for (JsonVariant c : kv.value().as<JsonArray>()) {
                 monitoredCities.push_back(c.as<String>());
+            }
         }
     }
     Serial.printf("Monitoring %d cities\n", monitoredCities.size());
@@ -340,7 +373,7 @@ void handleHome() {
         + "<div class=\"card\"><h2>Status</h2>"
         + "<p>Connected to: <b>" + mySSID + "</b></p>"
         + "<p>Monitoring: <b>" + String(n) + " area(s)</b></p>"
-        + "<p>TLS: <b>" + (tlsOK ? "Connected" : "Disconnected") + "</b></p></div>"
+        + "<p>Status: <b>" + (tlsOK ? "Online" : "Offline") + "</b></p></div>"
         + "</body></html>";
     srv.send(200, "text/html; charset=utf-8", html);
 }
@@ -734,9 +767,10 @@ bool checkAlerts() {
 
     for (JsonVariant ac : doc["data"].as<JsonArray>()) {
         String alertCity = ac.as<String>();
-        for (const auto& mc : monitoredCities) {
-            if (alertCity.indexOf(mc) >= 0 || mc.indexOf(alertCity) >= 0) {
-                Serial.println("ALERT MATCH: " + alertCity);
+        for (int i = 0; i < (int)monitoredCities.size(); i++) {
+            if (alertCity.indexOf(monitoredCities[i]) >= 0 || monitoredCities[i].indexOf(alertCity) >= 0) {
+                alertMatchCity = monitoredCities[i];
+                Serial.println("ALERT MATCH: " + alertCity + " -> " + alertMatchCity);
                 return true;
             }
         }
@@ -769,11 +803,9 @@ void setup() {
 
     // Hardware
     Wire.begin(OLED_SDA, OLED_SCL);
-    if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-        Serial.println("OLED init failed!");
-    }
-    oled.clearDisplay();
-    oled.display();
+    oled.begin();
+    oled.clearBuffer();
+    oled.sendBuffer();
     initBuzzer();
     buzzOff();
     pinMode(BTN_PIN, INPUT_PULLUP);
@@ -832,16 +864,14 @@ void setup() {
     refreshMonitoredCities();
 
     // Establish TLS before web server
-    if (!monitoredCities.empty()) {
-        show6("TLS handshake...");
-        connectTLS();
-        if (tlsOK) {
-            show6("Connected!", ("IP: " + myIP).c_str(),
-                  ("WiFi: " + mySSID).c_str(), "", "TLS: OK");
-        } else {
-            show6("Connected!", ("IP: " + myIP).c_str(),
-                  ("WiFi: " + mySSID).c_str(), "", "TLS: FAILED", "Will retry...");
-        }
+    show6("TLS handshake...");
+    connectTLS();
+    if (tlsOK) {
+        show6("Connected!", ("IP: " + myIP).c_str(),
+              ("WiFi: " + mySSID).c_str(), "", "Online");
+    } else {
+        show6("Connected!", ("IP: " + myIP).c_str(),
+              ("WiFi: " + mySSID).c_str(), "", "Offline", "Will retry...");
     }
     delay(2000);
 
@@ -860,6 +890,7 @@ void setup() {
     srv.on("/test", HTTP_POST, handleTest);
     srv.on("/clear_test", HTTP_POST, handleClearTest);
     srv.on("/reset_all", HTTP_POST, handleResetAll);
+    srv.on("/favicon.ico", []() { srv.send(204); });
     srv.begin();
 
     Serial.println("Station mode - IP: " + myIP);
@@ -895,20 +926,55 @@ void loop() {
     // Display
     if (alertActive) {
         displayToggle = !displayToggle;
+        oled.clearBuffer();
+        oled.setFont(u8g2_font_6x10_tf);
+        oled.drawStr(0, 10, "!! ALERT !!");
+        // Show city name in Hebrew
+        oled.setFont(u8g2_font_unifont_t_hebrew);
+        String rev = reverseUTF8(alertMatchCity);
+        int w = oled.getUTF8Width(rev.c_str());
+        oled.drawUTF8(128 - w, 32, rev.c_str());
+        oled.setFont(u8g2_font_6x10_tf);
         if (displayToggle) {
-            show6("!! ALERT !!", "", "Red Alert!", "", "Press btn", "to silence");
+            oled.drawStr(0, 50, "Press btn");
+            oled.drawStr(0, 60, "to silence");
         } else {
-            show6("!! ALERT !!", "", "ACTIVE", "", "Press btn", "to silence");
+            oled.drawStr(0, 50, "Red Alert!");
         }
+        oled.sendBuffer();
     } else {
-        int n = monitoredCities.size();
-        String status = n > 0 ? String(n) + " cities" : "Not set";
-        String tls = tlsOK ? "TLS:OK" : "TLS:--";
-        show6("Emergency Alert", ("IP: " + myIP).c_str(), "",
-              "Monitoring:", status.c_str(), tls.c_str());
+        unsigned long now2 = millis();
+        // Alternate between status screen and city list every 4s
+        if (now2 - lastDisplaySwitch > 4000) {
+            lastDisplaySwitch = now2;
+            if (!monitoredCities.empty()) {
+                showCityList = !showCityList;
+                if (showCityList) cityScrollOffset += 3;
+                if (cityScrollOffset >= (int)monitoredCities.size()) cityScrollOffset = 0;
+            }
+        }
+        if (showCityList && !monitoredCities.empty()) {
+            // Show Hebrew city names
+            oled.clearBuffer();
+            oled.setFont(u8g2_font_6x10_tf);
+            oled.drawStr(0, 10, "Monitoring:");
+            oled.setFont(u8g2_font_unifont_t_hebrew);
+            for (int i = 0; i < 3 && (cityScrollOffset + i) < (int)monitoredCities.size(); i++) {
+                String rev = reverseUTF8(monitoredCities[cityScrollOffset + i]);
+                int w = oled.getUTF8Width(rev.c_str());
+                oled.drawUTF8(128 - w, 28 + i * 16, rev.c_str());
+            }
+            oled.sendBuffer();
+        } else {
+            int n = monitoredCities.size();
+            String status = n > 0 ? String(n) + " cities" : "Not set";
+            String online = tlsOK ? "Online" : "Offline";
+            show6("Emergency Alert", ("IP: " + myIP).c_str(), "",
+                  "Monitoring:", status.c_str(), online.c_str());
+        }
     }
 
-    // Siren
+    // Alarm sound
     if (alertActive && !alertSilenced) {
         siren();
     } else {
