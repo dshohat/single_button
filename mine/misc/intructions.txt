@@ -1,0 +1,35 @@
+cd C:\Users\dshohat\source\repos\single_button
+..\venv_14\Scripts\activate.bat
+python .\installation_files\esptool\esptool.py --chip esp32 --port COM5 erase_flash
+python .\installation_files\esptool\esptool.py --chip esp32 --port COM5 --baud 921600 write_flash -z 0x1000 .\mine\misc\ESP32_GENERIC-20251209-v1.27.0.bin
+
+=== Emergency Alerts - Test Alarm ===
+
+After the device is connected to WiFi and running, you can test the alarm in two ways:
+
+1. Via the Web UI:
+   - Browse to the device IP (shown on OLED)
+   - Click "Trigger Test Alarm" button
+   - The siren will sound and the OLED will flash "!! ALERT !!"
+   - Press the physical button to silence, or click "Stop Test Alarm" on the web page
+
+2. Via command line (replace IP with your device's IP):
+   - Trigger test alarm:
+     curl -X POST http://DEVICE_IP/test
+   - Stop test alarm:
+     curl -X POST http://DEVICE_IP/clear_test
+   - PowerShell alternative:
+     Invoke-WebRequest -Method POST -Uri http://DEVICE_IP/test
+     Invoke-WebRequest -Method POST -Uri http://DEVICE_IP/clear_test
+
+=== Files to upload to device ===
+Upload these files from mine\code\ to the ESP32:
+  - emergency_alerts.py
+  - areas.json        (read-only reference: all areas->cities)
+  - area_names.json   (lightweight list of area names only)
+  - ssd1306.py
+  - boot.py (should contain: execfile("emergency_alerts.py"))
+
+Config files (auto-created on device, do NOT upload):
+  - wifi_config.json   (saved WiFi networks)
+  - alert_areas.json   (selected areas/cities to monitor)

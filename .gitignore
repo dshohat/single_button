@@ -1,2 +1,4 @@
 keys.py
 lounch_cmd.bat
+__pycache__/
+.pio/
