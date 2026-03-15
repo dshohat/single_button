@@ -54,20 +54,45 @@ WebServer srv(80);
 WiFiClientSecure tlsClient;
 
 bool isAP = false;
-bool alertActive = false;
-bool alertSilenced = false;
+bool alertActive = false;      // cat 1-7,13: siren alert
+bool newsFlashActive = false;  // cat 10: flashing text alert
 bool testAlertOn = false;
+String testInjectedBody;        // JSON body injected by test script
+bool   testHasInjection = false; // new injection waiting to be processed
 bool tlsOK = false;
 unsigned long lastPoll = 0;
 bool displayToggle = true;
 String mySSID;
 String myIP;
 std::vector<String> monitoredCities;
-String alertMatchCity;
+String alertMatchCity;         // matched city name (Hebrew)
+String alertTitle;             // e.g. "ירי רקטות וטילים"
+String alertDesc;              // e.g. "היכנסו למרחב המוגן ושהו בו 10 דקות"
+int    alertCat = 0;           // category number
 String scanResultsHTML;
 unsigned long lastDisplaySwitch = 0;
 int cityScrollOffset = 0;
 bool showCityList = false;
+unsigned long lastFlashToggle = 0;
+
+// ===== Alert Log (file-based on LittleFS) =====
+static const char* LOG_FILE = "/alert_log.txt";
+bool nightMode = false;
+
+void addAlertLog(int cat, const String& title, const String& desc, const String& city) {
+    Serial.printf("addAlertLog: cat=%d city=%s\n", cat, city.c_str());
+    File f = LittleFS.open(LOG_FILE, "a");
+    if (!f) { Serial.println("Failed to open log file"); return; }
+    JsonDocument doc;
+    doc["cat"] = cat;
+    doc["title"] = title;
+    doc["desc"] = desc;
+    doc["city"] = city;
+    doc["ms"] = millis();
+    serializeJson(doc, f);
+    f.println();
+    f.close();
+}
 
 // ===== Display helpers =====
 
@@ -331,6 +356,18 @@ void startAP() {
     myIP = WiFi.softAPIP().toString();
 }
 
+// ===== Alert State Management =====
+
+void clearAlertState() {
+    alertActive = false;
+    newsFlashActive = false;
+    alertCat = 0;
+    alertTitle = "";
+    alertDesc = "";
+    alertMatchCity = "";
+    buzzOff();
+}
+
 // ===== CSS & HTML helpers =====
 
 static const char CSS[] = R"rawliteral(<style>
@@ -350,7 +387,7 @@ input[type=checkbox]{width:18px;height:18px;margin-left:8px}
 .scroll{max-height:300px;overflow-y:auto;background:#0f1a30;padding:8px;border-radius:4px}
 </style>)rawliteral";
 
-static const char NAV[] = R"rawliteral(<nav><a href="/">Home</a><a href="/wifi">WiFi</a><a href="/areas">Areas</a><a href="/test_page">Test</a></nav><hr>)rawliteral";
+static const char NAV[] = R"rawliteral(<nav><a href="/">Home</a><a href="/wifi">WiFi</a><a href="/areas">Areas</a><a href="/log">Log</a><a href="/test_page">Test</a></nav><hr>)rawliteral";
 
 String htmlHead(const char* title) {
     return String("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
@@ -368,12 +405,17 @@ void sendRedirect(const String& url) {
 void handleHome() {
     JsonDocument cfg = loadAlertCfg();
     int n = cfg.as<JsonObject>().size();
+    String nightBtn = nightMode
+        ? "<button style=\"background:#2ecc71\">Day Mode (screen on)</button>"
+        : "<button style=\"background:#555\">Night Mode (screen off)</button>";
     String html = htmlHead("Emergency Alerts")
         + "<h1>Emergency Alerts</h1>" + NAV
         + "<div class=\"card\"><h2>Status</h2>"
         + "<p>Connected to: <b>" + mySSID + "</b></p>"
         + "<p>Monitoring: <b>" + String(n) + " area(s)</b></p>"
-        + "<p>Status: <b>" + (tlsOK ? "Online" : "Offline") + "</b></p></div>"
+        + "<p>Status: <b>" + (tlsOK ? "Online" : "Offline") + "</b></p>"
+        + "<p>Display: <b>" + (nightMode ? "Night" : "Day") + "</b></p>"
+        + "<form method=\"POST\" action=\"/night\">" + nightBtn + "</form></div>"
         + "</body></html>";
     srv.send(200, "text/html; charset=utf-8", html);
 }
@@ -570,15 +612,97 @@ void handleClearAreas() {
 
 // ===== Web Handlers: Test =====
 
+void handleLog() {
+    srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    srv.send(200, "text/html; charset=utf-8", "");
+    srv.sendContent(htmlHead("Alert Log"));
+    srv.sendContent(String("<h1>Alert Log</h1>") + NAV);
+
+    File f = LittleFS.open(LOG_FILE, "r");
+    if (!f || f.size() == 0) {
+        if (f) f.close();
+        srv.sendContent("<div class=\"card\"><p>No alerts recorded yet.</p></div>");
+    } else {
+        // Read all lines into a vector to display newest-first
+        std::vector<String> lines;
+        while (f.available()) {
+            String line = f.readStringUntil('\n');
+            line.trim();
+            if (line.length() > 0) lines.push_back(line);
+        }
+        f.close();
+        srv.sendContent("<div class=\"card\"><h2>" + String(lines.size()) + " alert(s)</h2>");
+        for (int i = (int)lines.size() - 1; i >= 0; i--) {
+            JsonDocument doc;
+            if (deserializeJson(doc, lines[i])) continue;
+            int cat = doc["cat"].as<int>();
+            String title = doc["title"].as<String>();
+            String city = doc["city"].as<String>();
+            String desc = doc["desc"].as<String>();
+            unsigned long ms = doc["ms"].as<unsigned long>();
+            unsigned long ago = (millis() - ms) / 1000;
+            String agoStr;
+            if (ago < 60) agoStr = String(ago) + "s ago";
+            else if (ago < 3600) agoStr = String(ago / 60) + "m ago";
+            else agoStr = String(ago / 3600) + "h " + String((ago % 3600) / 60) + "m ago";
+            srv.sendContent("<div style=\"border-bottom:1px solid #1f2b4d;padding:8px 0\">"
+                "<b>cat=" + String(cat) + "</b> &mdash; " + agoStr + "<br>"
+                "<b>title:</b> " + title + "<br>"
+                "<b>city:</b> " + city + "<br>"
+                "<b>desc:</b> " + desc + "</div>");
+        }
+        srv.sendContent("</div>");
+    }
+    srv.sendContent(
+        "<div class=\"card\" style=\"text-align:center\">"
+        "<a href=\"/log_download\" style=\"font-size:16px\">Download log file</a>"
+        "<form method=\"POST\" action=\"/log_clear\" style=\"margin-top:10px\">"
+        "<button style=\"background:#555\">Clear log</button></form></div>"
+        "<div class=\"card\" style=\"text-align:center\">"
+        "<a href=\"https://www.oref.org.il/heb/alerts-history\" target=\"_blank\" "
+        "style=\"font-size:18px\">\xD7\x94\xD7\x99\xD7\xA1\xD7\x98\xD7\x95\xD7\xA8\xD7\x99\xD7\x99\xD7\xAA "
+        "\xD7\x94\xD7\xAA\xD7\xA8\xD7\x90\xD7\x95\xD7\xAA</a></div>"
+        "</body></html>");
+    srv.sendContent("");
+}
+
+void handleLogDownload() {
+    File f = LittleFS.open(LOG_FILE, "r");
+    if (!f) { srv.send(200, "text/plain", "(empty)"); return; }
+    srv.streamFile(f, "text/plain");
+    f.close();
+}
+
+void handleLogClear() {
+    LittleFS.remove(LOG_FILE);
+    sendRedirect("/log");
+}
+
+void handleNightToggle() {
+    nightMode = !nightMode;
+    if (nightMode) {
+        oled.clearBuffer();
+        oled.sendBuffer();
+    }
+    sendRedirect("/");
+}
+
 void handleTestPage() {
-    String status = testAlertOn ? "ACTIVE" : "Inactive";
+    String status = testAlertOn ? "ACTIVE - listening for injected alerts" : "Inactive";
     String html = htmlHead("Test")
-        + "<h1>Test Alarm</h1>" + NAV
-        + "<div class=\"card\"><p>Test alarm: <b>" + status + "</b></p>"
+        + "<h1>Test Mode</h1>" + NAV
+        + "<div class=\"card\"><p>Test mode: <b>" + status + "</b></p>"
         + "<form method=\"POST\" action=\"/test\">"
-        + "<button type=\"submit\" class=\"test-btn\">Trigger Test Alarm</button></form>"
+        + "<button type=\"submit\" class=\"test-btn\">" + (testAlertOn ? "Already Active" : "Enter Test Mode") + "</button></form>"
         + "<form method=\"POST\" action=\"/clear_test\">"
-        + "<button type=\"submit\" style=\"background:#555;margin-top:5px\">Stop Test Alarm</button></form>"
+        + "<button type=\"submit\" style=\"background:#555;margin-top:5px\">Exit Test Mode</button></form>"
+        + "</div>"
+        + "<div class=\"card\"><h2>Instructions</h2>"
+        + "<p>1. Enter test mode above</p>"
+        + "<p>2. On your laptop, run:</p>"
+        + "<pre style=\"background:#0f1a30;padding:10px;border-radius:4px;overflow-x:auto\">python test_alerts.py " + myIP + "</pre>"
+        + "<p>3. Choose alert scenario from the menu</p>"
+        + "<p>4. The device will react as if it were a real alert</p>"
         + "</div>"
         + "<div class=\"card\"><form action=\"/reset_all\" method=\"POST\">"
         + "<button style=\"background:#c0392b\">Factory Reset</button>"
@@ -588,14 +712,33 @@ void handleTestPage() {
 
 void handleTest() {
     testAlertOn = true;
+    testHasInjection = false;
+    testInjectedBody = "";
+    clearAlertState();
     sendRedirect("/test_page");
 }
 
 void handleClearTest() {
     testAlertOn = false;
-    alertActive = false;
-    alertSilenced = false;
+    testHasInjection = false;
+    testInjectedBody = "";
+    clearAlertState();
     sendRedirect("/test_page");
+}
+
+void handleTestInject() {
+    if (!testAlertOn) {
+        srv.send(403, "application/json", "{\"error\":\"Test mode not active\"}");
+        return;
+    }
+    if (!srv.hasArg("plain")) {
+        srv.send(400, "application/json", "{\"error\":\"No JSON body\"}");
+        return;
+    }
+    testInjectedBody = srv.arg("plain");
+    testHasInjection = true;
+    Serial.println("Test inject: " + testInjectedBody);
+    srv.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleResetAll() {
@@ -673,15 +816,15 @@ void connectTLS() {
     }
 }
 
-bool checkAlerts() {
-    if (testAlertOn) return true;
-    if (monitoredCities.empty()) return false;
+// Returns: 0 = no alert, >0 = alert category for monitored city
+int pollAlerts() {
+    if (monitoredCities.empty()) return 0;
 
     // Reconnect if needed
     if (!tlsClient.connected()) {
         tlsOK = false;
         connectTLS();
-        if (!tlsOK) return false;
+        if (!tlsOK) return 0;
     }
 
     // Send HTTP request over persistent connection
@@ -703,7 +846,7 @@ bool checkAlerts() {
             Serial.println("Alert: response timeout");
             tlsClient.stop();
             tlsOK = false;
-            return false;
+            return 0;
         }
         delay(10);
     }
@@ -751,7 +894,7 @@ bool checkAlerts() {
 
     // Parse response
     body.trim();
-    if (body.isEmpty() || body == "\"\"" || body == "{}" || body == "[]") return false;
+    if (body.isEmpty() || body == "\"\"" || body == "{}" || body == "[]") return 0;
 
     // Remove BOM
     if (body.length() > 2 && (uint8_t)body.charAt(0) == 0xEF
@@ -759,23 +902,35 @@ bool checkAlerts() {
         body = body.substring(3);
         body.trim();
     }
-    if (body.isEmpty()) return false;
+    if (body.isEmpty()) return 0;
 
     JsonDocument doc;
-    if (deserializeJson(doc, body)) return false;
-    if (!doc["data"].is<JsonArray>() || doc["data"].as<JsonArray>().size() == 0) return false;
+    if (deserializeJson(doc, body)) return 0;
+    if (!doc["data"].is<JsonArray>() || doc["data"].as<JsonArray>().size() == 0) return 0;
+
+    // Extract cat, title, desc
+    int cat = doc["cat"].as<int>();
+    if (cat == 0 && doc["cat"].is<const char*>())
+        cat = atoi(doc["cat"].as<const char*>());
+    String title = doc["title"].as<String>();
+    String desc = doc["desc"].as<String>();
 
     for (JsonVariant ac : doc["data"].as<JsonArray>()) {
-        String alertCity = ac.as<String>();
+        String city = ac.as<String>();
         for (int i = 0; i < (int)monitoredCities.size(); i++) {
-            if (alertCity.indexOf(monitoredCities[i]) >= 0 || monitoredCities[i].indexOf(alertCity) >= 0) {
+            if (city.indexOf(monitoredCities[i]) >= 0 || monitoredCities[i].indexOf(city) >= 0) {
                 alertMatchCity = monitoredCities[i];
-                Serial.println("ALERT MATCH: " + alertCity + " -> " + alertMatchCity);
-                return true;
+                alertTitle = title;
+                alertDesc = desc;
+                alertCat = cat;
+                Serial.printf("ALERT MATCH cat=%d: %s -> %s\n", cat, city.c_str(), alertMatchCity.c_str());
+                Serial.println("  title: " + title);
+                Serial.println("  desc:  " + desc);
+                return cat;
             }
         }
     }
-    return false;
+    return 0;
 }
 
 // ===== Setup =====
@@ -886,8 +1041,13 @@ void setup() {
     srv.on("/save_area", HTTP_POST, handleSaveArea);
     srv.on("/area_off", HTTP_POST, handleAreaOff);
     srv.on("/clear_areas", HTTP_POST, handleClearAreas);
+    srv.on("/log", handleLog);
+    srv.on("/log_download", handleLogDownload);
+    srv.on("/log_clear", HTTP_POST, handleLogClear);
+    srv.on("/night", HTTP_POST, handleNightToggle);
     srv.on("/test_page", handleTestPage);
     srv.on("/test", HTTP_POST, handleTest);
+    srv.on("/test_inject", HTTP_POST, handleTestInject);
     srv.on("/clear_test", HTTP_POST, handleClearTest);
     srv.on("/reset_all", HTTP_POST, handleResetAll);
     srv.on("/favicon.ico", []() { srv.send(204); });
@@ -910,41 +1070,144 @@ void loop() {
     unsigned long now = millis();
     if (now - lastPoll > POLL_MS) {
         lastPoll = now;
-        bool hasAlert = checkAlerts();
-        if (hasAlert && !alertActive) {
-            alertActive = true;
-            alertSilenced = false;
-            Serial.println("ALERT ACTIVE!");
-        } else if (!hasAlert && alertActive && !testAlertOn) {
-            alertActive = false;
-            alertSilenced = false;
-            Serial.println("Alert cleared");
-            buzz(100, 440);
+
+        int cat = 0;
+        if (testAlertOn) {
+            // In test mode: process injected JSON or keep current state
+            if (testHasInjection) {
+                testHasInjection = false;
+                String body = testInjectedBody;
+                body.trim();
+                if (body.isEmpty() || body == "\"\"" || body == "{}" || body == "[]") {
+                    // Empty injection = clear alert
+                    cat = 0;
+                    if (alertActive || newsFlashActive) {
+                        Serial.println("Test: alert cleared by empty injection");
+                        clearAlertState();
+                        buzz(100, 440);
+                    }
+                } else {
+                    JsonDocument doc;
+                    if (!deserializeJson(doc, body)
+                        && doc["data"].is<JsonArray>()
+                        && doc["data"].as<JsonArray>().size() > 0) {
+                        cat = doc["cat"].as<int>();
+                        if (cat == 0 && doc["cat"].is<const char*>())
+                            cat = atoi(doc["cat"].as<const char*>());
+                        alertCat = cat;
+                        alertTitle = doc["title"].as<String>();
+                        alertDesc = doc["desc"].as<String>();
+                        alertMatchCity = doc["data"][0].as<String>();
+                        Serial.printf("Test inject cat=%d city=%s\n", cat, alertMatchCity.c_str());
+                    }
+                }
+            }
+            // If no new injection, keep cat=0 so existing state persists
+        } else {
+            cat = pollAlerts();
+        }
+
+        if (cat > 0) {
+            if (cat == 10) {
+                // NewsFlash: check if event ended
+                if (alertTitle.indexOf("\xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D") >= 0
+                    || alertDesc.indexOf("\xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D") >= 0) {
+                    // "הסתיים" found -> event over
+                    if (alertActive || newsFlashActive) {
+                        addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
+                        Serial.println("Event ended (הסתיים)");
+                        clearAlertState();
+                        buzz(200, 300);
+                    }
+                } else {
+                    // Active newsFlash
+                    newsFlashActive = true;
+                    alertActive = false;
+                    addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
+                    Serial.println("NEWSFLASH: " + alertTitle);
+                }
+            } else if ((cat >= 1 && cat <= 7) || cat == 13) {
+                // Siren alert
+                if (!alertActive) {
+                    alertActive = true;
+                    newsFlashActive = false;
+                    addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
+                    Serial.println("SIREN ALERT cat=" + String(cat));
+                }
+            }
+        } else if (!testAlertOn) {
+            // No alert data from API
+            if (alertActive || newsFlashActive) {
+                Serial.println("Alert cleared by API");
+                clearAlertState();
+                buzz(100, 440);
+            }
         }
     }
 
-    // Display
+    // ===== Display =====
     if (alertActive) {
+        // Siren alert display: show title, city, desc in Hebrew
         displayToggle = !displayToggle;
         oled.clearBuffer();
         oled.setFont(u8g2_font_6x10_tf);
         oled.drawStr(0, 10, "!! ALERT !!");
-        // Show city name in Hebrew
+        // Show alert title in Hebrew (e.g. ירי רקטות וטילים)
         oled.setFont(u8g2_font_unifont_t_hebrew);
-        String rev = reverseUTF8(alertMatchCity);
-        int w = oled.getUTF8Width(rev.c_str());
-        oled.drawUTF8(128 - w, 32, rev.c_str());
+        String revTitle = reverseUTF8(alertTitle);
+        int tw = oled.getUTF8Width(revTitle.c_str());
+        oled.drawUTF8(128 - tw, 26, revTitle.c_str());
+        // Show city name in Hebrew
+        String revCity = reverseUTF8(alertMatchCity);
+        int cw = oled.getUTF8Width(revCity.c_str());
+        oled.drawUTF8(128 - cw, 42, revCity.c_str());
+        // Show desc (shelter instructions)
         oled.setFont(u8g2_font_6x10_tf);
         if (displayToggle) {
-            oled.drawStr(0, 50, "Press btn");
-            oled.drawStr(0, 60, "to silence");
+            // Truncate desc for display
+            String d = alertDesc.substring(0, 21);
+            oled.drawStr(0, 56, d.c_str());
         } else {
-            oled.drawStr(0, 50, "Red Alert!");
+            oled.drawStr(0, 56, "Press btn to dismiss");
         }
         oled.sendBuffer();
+
+    } else if (newsFlashActive) {
+        // NewsFlash: flash screen (0.5s white / 0.5s text)
+        unsigned long now3 = millis();
+        if (now3 - lastFlashToggle > 500) {
+            lastFlashToggle = now3;
+            displayToggle = !displayToggle;
+        }
+        if (displayToggle) {
+            // Full white screen (inverted)
+            oled.clearBuffer();
+            oled.drawBox(0, 0, 128, 64);
+            oled.sendBuffer();
+        } else {
+            // Show message text and city
+            oled.clearBuffer();
+            oled.setFont(u8g2_font_6x10_tf);
+            oled.drawStr(0, 10, "-- NEWS FLASH --");
+            oled.setFont(u8g2_font_unifont_t_hebrew);
+            String revTitle = reverseUTF8(alertTitle);
+            int tw = oled.getUTF8Width(revTitle.c_str());
+            oled.drawUTF8(128 - tw, 28, revTitle.c_str());
+            String revCity = reverseUTF8(alertMatchCity);
+            int cw = oled.getUTF8Width(revCity.c_str());
+            oled.drawUTF8(128 - cw, 46, revCity.c_str());
+            oled.setFont(u8g2_font_6x10_tf);
+            oled.drawStr(0, 60, "Press btn to dismiss");
+            oled.sendBuffer();
+        }
+
+    } else if (nightMode) {
+        // Night mode: blank screen
+        oled.clearBuffer();
+        oled.sendBuffer();
     } else {
+        // Normal mode: status / city list
         unsigned long now2 = millis();
-        // Alternate between status screen and city list every 4s
         if (now2 - lastDisplaySwitch > 4000) {
             lastDisplaySwitch = now2;
             if (!monitoredCities.empty()) {
@@ -954,7 +1217,6 @@ void loop() {
             }
         }
         if (showCityList && !monitoredCities.empty()) {
-            // Show Hebrew city names
             oled.clearBuffer();
             oled.setFont(u8g2_font_6x10_tf);
             oled.drawStr(0, 10, "Monitoring:");
@@ -968,25 +1230,26 @@ void loop() {
         } else {
             int n = monitoredCities.size();
             String status = n > 0 ? String(n) + " cities" : "Not set";
-            String online = tlsOK ? "Online" : "Offline";
+            String online = testAlertOn ? "TEST MODE" : (tlsOK ? "Online" : "Offline");
             show6("Emergency Alert", ("IP: " + myIP).c_str(), "",
                   "Monitoring:", status.c_str(), online.c_str());
         }
     }
 
-    // Alarm sound
-    if (alertActive && !alertSilenced) {
+    // Alarm sound (only for siren alerts, not newsFlash)
+    if (alertActive) {
         siren();
     } else {
         delay(100);
     }
 
-    // Button to silence
+    // Button: dismiss alert entirely (siren or newsFlash)
     if (digitalRead(BTN_PIN) == LOW) {
-        if (alertActive && !alertSilenced) {
-            alertSilenced = true;
-            buzzOff();
-            show6("Alarm silenced", "", "Alert still", "active");
+        if (alertActive || newsFlashActive) {
+            Serial.println("Button pressed - dismissing alert");
+            clearAlertState();
+            testAlertOn = false;
+            show6("Alert dismissed");
             buzz(50, 440);
             delay(500);
         }
