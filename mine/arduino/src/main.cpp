@@ -26,6 +26,7 @@
 #include <U8g2lib.h>
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <time.h>
 #include <vector>
 #include <algorithm>
 
@@ -75,12 +76,36 @@ int cityScrollOffset = 0;
 bool showCityList = false;
 unsigned long lastFlashToggle = 0;
 
+// ===== Time helpers =====
+void initNTP() {
+    configTzTime("IST-2IDT,M3.4.5/02,M10.5.0/02", "pool.ntp.org", "time.nist.gov");
+    Serial.print("Syncing NTP...");
+    struct tm t;
+    for (int i = 0; i < 20 && !getLocalTime(&t, 500); i++) Serial.print(".");
+    if (getLocalTime(&t, 0)) {
+        char buf[20];
+        strftime(buf, sizeof(buf), "%d/%m/%y %H:%M:%S", &t);
+        Serial.printf(" OK: %s\n", buf);
+    } else {
+        Serial.println(" failed (will retry in background)");
+    }
+}
+
+String nowStr() {
+    struct tm t;
+    if (!getLocalTime(&t, 0)) return "--/--/-- --:--";
+    char buf[18];
+    strftime(buf, sizeof(buf), "%d/%m/%y %H:%M", &t);
+    return String(buf);
+}
+
 // ===== Alert Log (file-based on LittleFS) =====
 static const char* LOG_FILE = "/alert_log.txt";
 bool nightMode = false;
 
 void addAlertLog(int cat, const String& title, const String& desc, const String& city) {
-    Serial.printf("addAlertLog: cat=%d city=%s\n", cat, city.c_str());
+    String ts = nowStr();
+    Serial.printf("[%s] addAlertLog: cat=%d city=%s\n", ts.c_str(), cat, city.c_str());
     File f = LittleFS.open(LOG_FILE, "a");
     if (!f) { Serial.println("Failed to open log file"); return; }
     JsonDocument doc;
@@ -88,7 +113,7 @@ void addAlertLog(int cat, const String& title, const String& desc, const String&
     doc["title"] = title;
     doc["desc"] = desc;
     doc["city"] = city;
-    doc["ms"] = millis();
+    doc["time"] = ts;
     serializeJson(doc, f);
     f.println();
     f.close();
@@ -156,9 +181,7 @@ void siren() {
 }
 
 void startupBeep() {
-    buzz(100, 660);
-    delay(50);
-    buzz(100, 880);
+    buzz(80, 220);
 }
 
 // ===== URL helpers =====
@@ -618,40 +641,39 @@ void handleLog() {
     srv.sendContent(htmlHead("Alert Log"));
     srv.sendContent(String("<h1>Alert Log</h1>") + NAV);
 
-    File f = LittleFS.open(LOG_FILE, "r");
-    if (!f || f.size() == 0) {
-        if (f) f.close();
+    if (!LittleFS.exists(LOG_FILE)) {
         srv.sendContent("<div class=\"card\"><p>No alerts recorded yet.</p></div>");
     } else {
-        // Read all lines into a vector to display newest-first
-        std::vector<String> lines;
-        while (f.available()) {
-            String line = f.readStringUntil('\n');
-            line.trim();
-            if (line.length() > 0) lines.push_back(line);
+        File f = LittleFS.open(LOG_FILE, "r");
+        if (!f || f.size() == 0) {
+            if (f) f.close();
+            srv.sendContent("<div class=\"card\"><p>No alerts recorded yet.</p></div>");
+        } else {
+            std::vector<String> lines;
+            while (f.available()) {
+                String line = f.readStringUntil('\n');
+                line.trim();
+                if (line.length() > 0) lines.push_back(line);
+            }
+            f.close();
+            srv.sendContent("<div class=\"card\"><h2>" + String(lines.size()) + " alert(s)</h2>");
+            for (int i = (int)lines.size() - 1; i >= 0; i--) {
+                JsonDocument doc;
+                if (deserializeJson(doc, lines[i])) continue;
+                int cat = doc["cat"].as<int>();
+                String title = doc["title"].as<String>();
+                String city = doc["city"].as<String>();
+                String desc = doc["desc"].as<String>();
+                String ts = doc["time"].as<String>();
+                if (ts.isEmpty()) ts = "(no time)";
+                srv.sendContent("<div style=\"border-bottom:1px solid #1f2b4d;padding:8px 0\">"
+                    "<b>cat=" + String(cat) + "</b> &mdash; " + ts + "<br>"
+                    "<b>title:</b> " + title + "<br>"
+                    "<b>city:</b> " + city + "<br>"
+                    "<b>desc:</b> " + desc + "</div>");
+            }
+            srv.sendContent("</div>");
         }
-        f.close();
-        srv.sendContent("<div class=\"card\"><h2>" + String(lines.size()) + " alert(s)</h2>");
-        for (int i = (int)lines.size() - 1; i >= 0; i--) {
-            JsonDocument doc;
-            if (deserializeJson(doc, lines[i])) continue;
-            int cat = doc["cat"].as<int>();
-            String title = doc["title"].as<String>();
-            String city = doc["city"].as<String>();
-            String desc = doc["desc"].as<String>();
-            unsigned long ms = doc["ms"].as<unsigned long>();
-            unsigned long ago = (millis() - ms) / 1000;
-            String agoStr;
-            if (ago < 60) agoStr = String(ago) + "s ago";
-            else if (ago < 3600) agoStr = String(ago / 60) + "m ago";
-            else agoStr = String(ago / 3600) + "h " + String((ago % 3600) / 60) + "m ago";
-            srv.sendContent("<div style=\"border-bottom:1px solid #1f2b4d;padding:8px 0\">"
-                "<b>cat=" + String(cat) + "</b> &mdash; " + agoStr + "<br>"
-                "<b>title:</b> " + title + "<br>"
-                "<b>city:</b> " + city + "<br>"
-                "<b>desc:</b> " + desc + "</div>");
-        }
-        srv.sendContent("</div>");
     }
     srv.sendContent(
         "<div class=\"card\" style=\"text-align:center\">"
@@ -667,6 +689,10 @@ void handleLog() {
 }
 
 void handleLogDownload() {
+    if (!LittleFS.exists(LOG_FILE)) {
+        srv.send(200, "text/plain", "(empty)");
+        return;
+    }
     File f = LittleFS.open(LOG_FILE, "r");
     if (!f) { srv.send(200, "text/plain", "(empty)"); return; }
     srv.streamFile(f, "text/plain");
@@ -675,6 +701,8 @@ void handleLogDownload() {
 
 void handleLogClear() {
     LittleFS.remove(LOG_FILE);
+    File f = LittleFS.open(LOG_FILE, "w");
+    if (f) f.close();
     sendRedirect("/log");
 }
 
@@ -971,6 +999,11 @@ void setup() {
         show6("FS ERROR!", "", "Reflash device");
         while (1) delay(1000);
     }
+    // Ensure log file exists so reads don't trigger VFS errors
+    if (!LittleFS.exists(LOG_FILE)) {
+        File f = LittleFS.open(LOG_FILE, "w");
+        if (f) f.close();
+    }
 
     show6("Emergency Alert", "", "Hold btn 3s", "to reset cfg");
     delay(500);
@@ -1017,6 +1050,9 @@ void setup() {
           ("WiFi: " + mySSID).c_str(), "", "Starting...");
     startupBeep();
     refreshMonitoredCities();
+
+    // Sync time via NTP
+    initNTP();
 
     // Establish TLS before web server
     show6("TLS handshake...");
@@ -1109,16 +1145,17 @@ void loop() {
 
         if (cat > 0) {
             if (cat == 10) {
-                // NewsFlash: check if event ended
-                if (alertTitle.indexOf("\xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D") >= 0
-                    || alertDesc.indexOf("\xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D") >= 0) {
-                    // "הסתיים" found -> event over
-                    if (alertActive || newsFlashActive) {
-                        addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
-                        Serial.println("Event ended (הסתיים)");
-                        clearAlertState();
-                        buzz(200, 300);
-                    }
+                // NewsFlash: check if event ended / safe to leave shelter
+                bool isEventOver = alertTitle.indexOf("\xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D") >= 0
+                    || alertDesc.indexOf("\xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D") >= 0
+                    || alertDesc.indexOf("\xD7\xA0\xD7\x99\xD7\xAA\xD7\x9F \xD7\x9C\xD7\xA6\xD7\x90\xD7\xAA") >= 0
+                    || alertTitle.indexOf("\xD7\xA0\xD7\x99\xD7\xAA\xD7\x9F \xD7\x9C\xD7\xA6\xD7\x90\xD7\xAA") >= 0;
+                if (isEventOver) {
+                    // "הסתיים" or "ניתן לצאת" found -> event over / safe to leave
+                    addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
+                    Serial.println("Event ended / safe to leave shelter");
+                    clearAlertState();
+                    buzz(200, 300);
                 } else {
                     // Active newsFlash
                     newsFlashActive = true;
