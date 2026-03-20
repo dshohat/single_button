@@ -17,6 +17,7 @@
 
 from machine import Pin, I2C, PWM, reset
 import ssd1306
+import framebuf
 import network
 import socket
 import json
@@ -52,6 +53,43 @@ _cached_networks = []
 _monitored_cities = set()
 _alert_conn = None
 
+# --- Alert State Machine ---
+STATE_IDLE = 0
+STATE_WARNING = 1   # בדקות הקרובות -> display התרעה
+STATE_SHELTER = 2   # ירי רקטות  -> display למקלט
+STATE_CLEAR = 3     # האירוע הסתיים -> display לצאת
+
+STATE_LABELS = {STATE_IDLE: 'Idle', STATE_WARNING: 'Warning', STATE_SHELTER: 'Shelter!', STATE_CLEAR: 'Clear'}
+STATE_HEBREW = {STATE_IDLE: '', STATE_WARNING: '\u05d4\u05ea\u05e8\u05e2\u05d4', STATE_SHELTER: '\u05dc\u05de\u05e7\u05dc\u05d8!', STATE_CLEAR: '\u05dc\u05e6\u05d0\u05ea'}
+STATE_BITMAPS = {STATE_WARNING: 'alert_warn.bin', STATE_SHELTER: 'alert_shelter.bin', STATE_CLEAR: 'alert_clear.bin'}
+
+_alert_state = STATE_IDLE
+
+def classify_alert(title):
+    """Map alert title to a state. Returns None if unrecognized."""
+    if '\u05d9\u05e8\u05d9 \u05e8\u05e7\u05d8\u05d5\u05ea' in title or '\u05d7\u05d3\u05d9\u05e8\u05ea' in title or '\u05e8\u05e2\u05d9\u05d3\u05ea' in title:
+        return STATE_SHELTER
+    if '\u05d1\u05d3\u05e7\u05d5\u05ea \u05d4\u05e7\u05e8\u05d5\u05d1\u05d5\u05ea' in title or '\u05d4\u05ea\u05e8\u05e2\u05d4 \u05de\u05d5\u05e7\u05d3\u05de\u05ea' in title:
+        return STATE_WARNING
+    if '\u05d4\u05d0\u05d9\u05e8\u05d5\u05e2 \u05d4\u05e1\u05ea\u05d9\u05d9\u05dd' in title:
+        return STATE_CLEAR
+    return None
+
+def show_state_bitmap(state):
+    """Display full-screen Hebrew bitmap for the given state."""
+    fn = STATE_BITMAPS.get(state)
+    if not fn:
+        return
+    try:
+        with open(fn, 'rb') as f:
+            data = bytearray(f.read())
+        fb = framebuf.FrameBuffer(data, 128, 64, framebuf.MONO_VLSB)
+        display.fill(0)
+        display.blit(fb, 0, 0)
+        display.show()
+    except Exception as e:
+        print('Bitmap error:', e)
+
 # --- Utility ---
 
 def buzz(ms, freq):
@@ -70,15 +108,23 @@ def show(lines):
     display.show()
 
 def siren():
+    """Play one siren sweep. Returns True if button was pressed during play."""
     for f in range(400, 900, 30):
+        if not button.value():
+            buzzer_pwm.duty(0)
+            return True
         buzzer_pwm.freq(f)
         buzzer_pwm.duty(512)
         time.sleep_ms(12)
     for f in range(900, 400, -30):
+        if not button.value():
+            buzzer_pwm.duty(0)
+            return True
         buzzer_pwm.freq(f)
         buzzer_pwm.duty(512)
         time.sleep_ms(12)
     buzzer_pwm.duty(0)
+    return False
 
 def startup_beep():
     buzz(100, 660)
@@ -250,10 +296,38 @@ STYLE = ('<style>'
     '.del-btn{background:#c0392b;width:auto;padding:4px 12px;font-size:13px;margin-right:8px}'
     '.test-btn{background:#ff9800}.test-btn:hover{background:#e68a00}'
     '.scroll{max-height:300px;overflow-y:auto;background:#0f1a30;padding:8px;border-radius:4px}'
+    '.state-box{text-align:center;padding:20px;border-radius:8px;margin:10px 0}'
+    '.state-idle{background:#16213e;border:2px solid #444}'
+    '.state-warn{background:#3d2100;border:3px solid #ff9800}'
+    '.state-shelter{background:#3d0000;border:3px solid #e94560}'
+    '.state-clear{background:#003d10;border:3px solid #2ecc71}'
     '</style>')
 
 def nav_bar():
     return '<nav><a href="/">Home</a><a href="/wifi">WiFi</a><a href="/areas">Areas</a><a href="/test_page">Test</a></nav><hr>'
+
+def _state_html():
+    """Return HTML fragment showing current alert state."""
+    st = _alert_state
+    if st == STATE_SHELTER:
+        css = 'state-shelter'
+        heb = '\u05dc\u05de\u05e7\u05dc\u05d8!'
+        lbl = 'SHELTER'
+    elif st == STATE_WARNING:
+        css = 'state-warn'
+        heb = '\u05d4\u05ea\u05e8\u05e2\u05d4'
+        lbl = 'WARNING'
+    elif st == STATE_CLEAR:
+        css = 'state-clear'
+        heb = '\u05dc\u05e6\u05d0\u05ea'
+        lbl = 'CLEAR'
+    else:
+        css = 'state-idle'
+        heb = '\u05ea\u05e7\u05d9\u05df'
+        lbl = 'IDLE'
+    return ('<div class="state-box ' + css + '">'
+        '<h1 style="font-size:64px;margin:0">' + heb + '</h1>'
+        '<p style="font-size:18px;margin:5px 0">' + lbl + '</p></div>')
 
 def page_home(connected_ssid):
     alert_cfg = load_alert_cfg()
@@ -261,8 +335,10 @@ def page_home(connected_ssid):
     return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta http-equiv="refresh" content="5">'
         '<title>Emergency Alerts</title>' + STYLE + '</head><body>'
         '<h1>Emergency Alerts</h1>' + nav_bar() +
+        _state_html() +
         '<div class="card"><h2>Status</h2>'
         '<p>Connected to: <b>' + connected_ssid + '</b></p>'
         '<p>Monitoring: <b>' + str(n) + ' area(s)</b></p></div>'
@@ -416,13 +492,20 @@ def page_test():
     return (
         '<!DOCTYPE html><html><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta http-equiv="refresh" content="5">'
         '<title>Test</title>' + STYLE + '</head><body>'
         '<h1>Test Alarm</h1>' + nav_bar() +
-        '<div class="card"><p>Test alarm: <b>' + status + '</b></p>'
+        _state_html() +
+        '<div class="card"><p>Test injection: <b>' + status + '</b></p>'
         '<form method="POST" action="/test">'
-        '<button type="submit" class="test-btn">Trigger Test Alarm</button></form>'
+        '<select name="type" style="width:100%;margin-bottom:8px">'
+        '<option value="warn">\u05d4\u05ea\u05e8\u05e2\u05d4 (Warning)</option>'
+        '<option value="shelter">\u05dc\u05de\u05e7\u05dc\u05d8 (Shelter)</option>'
+        '<option value="clear">\u05dc\u05e6\u05d0\u05ea (Clear)</option>'
+        '</select>'
+        '<button type="submit" class="test-btn">Trigger Test</button></form>'
         '<form method="POST" action="/clear_test">'
-        '<button type="submit" style="background:#555;margin-top:5px">Stop Test Alarm</button></form>'
+        '<button type="submit" style="background:#555;margin-top:5px">Reset to Idle</button></form>'
         '</div>'
         '<div class="card"><form action="/reset_all" method="POST">'
         '<button style="background:#c0392b">Factory Reset (clear all config & reboot)</button>'
@@ -584,7 +667,14 @@ def handle_request(conn, mode, connected_ssid=''):
     elif path == '/test_page':
         send_response(conn, page_test())
     elif path == '/test' and method == 'POST':
-        _test_alert = {'title': 'TEST ALERT', 'cities': ['Test City'], 'desc': 'Test alarm'}
+        qs = parse_qs_multi(body)
+        test_type = qs.get('type', ['warn'])[0]
+        if test_type == 'shelter':
+            _test_alert = {'title': '\u05d9\u05e8\u05d9 \u05e8\u05e7\u05d8\u05d5\u05ea \u05d5\u05d8\u05d9\u05dc\u05d9\u05dd', 'cities': ['Test'], 'desc': 'Test'}
+        elif test_type == 'clear':
+            _test_alert = {'title': '\u05d4\u05d0\u05d9\u05e8\u05d5\u05e2 \u05d4\u05e1\u05ea\u05d9\u05d9\u05dd', 'cities': ['Test'], 'desc': 'Test'}
+        else:
+            _test_alert = {'title': '\u05d1\u05d3\u05e7\u05d5\u05ea \u05d4\u05e7\u05e8\u05d5\u05d1\u05d5\u05ea \u05e6\u05e4\u05d5\u05d9\u05d5\u05ea \u05dc\u05d4\u05ea\u05e7\u05d1\u05dc \u05d4\u05ea\u05e8\u05e2\u05d5\u05ea', 'cities': ['Test'], 'desc': 'Test'}
         send_redirect(conn, '/test_page')
     elif path == '/clear_test' and method == 'POST':
         _test_alert = None
@@ -691,8 +781,15 @@ def check_alerts():
         if not raw or raw in ('""', '{}', '[]'):
             return None
 
+        # Log ALL raw responses for debugging (captures release messages etc.)
+        print('RAW ALERT RESPONSE:', raw)
+
         data = json.loads(raw)
         del raw
+
+        # Log parsed structure
+        print('PARSED ALERT:', data)
+
         if not data or 'data' not in data or not data['data']:
             return None
 
@@ -753,6 +850,7 @@ def run_ap_mode():
             print('AP error:', e)
 
 def run_station_mode(connected_ssid, ip):
+    global _alert_state
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(('0.0.0.0', 80))
@@ -760,18 +858,22 @@ def run_station_mode(connected_ssid, ip):
     srv.setblocking(False)
 
     last_poll = 0
-    alerting = False
-    alert_info = None
-    silenced = False
-    display_toggle = True
     reconnect_after = 0
+    siren_count = 0
+    siren_silenced = False
+    state_changed_at = 0
+    MAX_SIREN_PLAYS = 2
+    CLEAR_TIMEOUT_MS = 60000
+
+    _alert_state = STATE_IDLE
 
     print('Station mode - IP:', ip)
 
     while True:
         gc.collect()
+        now = time.ticks_ms()
 
-        # 1. Handle web requests
+        # 1. Handle web requests (non-blocking)
         try:
             conn, addr = srv.accept()
             conn.settimeout(5)
@@ -783,23 +885,28 @@ def run_station_mode(connected_ssid, ip):
             pass
 
         # 2. Poll alerts
-        now = time.ticks_ms()
         if time.ticks_diff(now, last_poll) > POLL_INTERVAL_MS:
             last_poll = now
             result = check_alerts()
-            if result and not alert_info:
-                alerting = True
-                silenced = False
-                alert_info = result
-                print('ALERT:', result)
-            elif not result and alert_info:
-                alerting = False
-                alert_info = None
-                silenced = False
-                print('Alert cleared')
-                buzz(100, 440)
+            if result:
+                title = result.get('title', '')
+                new_state = classify_alert(title)
+                if new_state is not None and new_state != _alert_state:
+                    old = STATE_LABELS.get(_alert_state, '?')
+                    _alert_state = new_state
+                    state_changed_at = now
+                    siren_count = 0
+                    siren_silenced = False
+                    print('STATE:', old, '->', STATE_LABELS.get(_alert_state, '?'))
 
-        # 2b. Reconnect TLS if dropped (close srv first to free IDF heap)
+        # 2b. Auto-clear CLEAR state after 60 seconds
+        if _alert_state == STATE_CLEAR:
+            if time.ticks_diff(now, state_changed_at) > CLEAR_TIMEOUT_MS:
+                _alert_state = STATE_IDLE
+                siren_silenced = True
+                print('CLEAR expired -> IDLE')
+
+        # 2c. Reconnect TLS if dropped
         if not _alert_conn and _monitored_cities:
             if reconnect_after == 0:
                 reconnect_after = time.ticks_add(now, 5000)
@@ -818,24 +925,10 @@ def run_station_mode(connected_ssid, ip):
                 srv.bind(('0.0.0.0', 80))
                 srv.listen(1)
                 srv.setblocking(False)
-                alerting = True
-                silenced = False
-                alert_info = result
-                print('ALERT:', result)
-            elif not result and alert_info:
-                alerting = False
-                alert_info = None
-                silenced = False
-                print('Alert cleared')
-                buzz(100, 440)
 
         # 3. Display
-        if alert_info and alerting:
-            display_toggle = not display_toggle
-            if display_toggle:
-                show(['!! ALERT !!', '', 'Red Alert!', '', 'Press btn', 'to silence'])
-            else:
-                show(['!! ALERT !!', '', 'ACTIVE', '', 'Press btn', 'to silence'])
+        if _alert_state != STATE_IDLE:
+            show_state_bitmap(_alert_state)
         else:
             alert_cfg = load_alert_cfg()
             n = len(alert_cfg)
@@ -843,20 +936,38 @@ def run_station_mode(connected_ssid, ip):
             tls = 'TLS:OK' if _alert_conn else 'TLS:--'
             show(['Emergency Alert', 'IP: ' + ip, '', 'Monitoring:', status, tls])
 
-        # 4. Alarm sound
-        if alerting and not silenced:
-            siren()
+        # 4. Sound: siren for WARNING/SHELTER, beep for CLEAR
+        if _alert_state in (STATE_WARNING, STATE_SHELTER) and not siren_silenced:
+            if siren_count < MAX_SIREN_PLAYS:
+                pressed = siren()
+                if pressed:
+                    siren_silenced = True
+                    buzzer_pwm.duty(0)
+                    while not button.value():
+                        time.sleep_ms(50)
+                    time.sleep_ms(300)
+                else:
+                    siren_count += 1
+                    if siren_count >= MAX_SIREN_PLAYS:
+                        siren_silenced = True
+            else:
+                time.sleep_ms(100)
+        elif _alert_state == STATE_CLEAR and not siren_silenced:
+            buzz(200, 880)
+            time.sleep_ms(100)
+            buzz(200, 880)
+            siren_silenced = True
         else:
             time.sleep_ms(100)
 
-        # 5. Button to silence
-        if not button.value():
-            if alerting and not silenced:
-                silenced = True
+        # 5. Button: just stop buzzer (no state change)
+        if not button.value() and not siren_silenced:
+            if _alert_state in (STATE_WARNING, STATE_SHELTER):
+                siren_silenced = True
                 buzzer_pwm.duty(0)
-                show(['Alarm silenced', '', 'Alert still', 'active'])
-                buzz(50, 440)
-                time.sleep_ms(500)
+                while not button.value():
+                    time.sleep_ms(50)
+                time.sleep_ms(300)
 
 def main():
     show(['Emergency Alert', '', 'Hold btn 3s', 'to reset cfg'])

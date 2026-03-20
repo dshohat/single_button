@@ -29,6 +29,7 @@
 #include <time.h>
 #include <vector>
 #include <algorithm>
+#include "hebrew_bitmaps.h"
 
 // ===== Pins =====
 #define BTN_PIN    4
@@ -55,26 +56,58 @@ WebServer srv(80);
 WiFiClientSecure tlsClient;
 
 bool isAP = false;
-bool alertActive = false;      // cat 1-7,13: siren alert
-bool newsFlashActive = false;  // cat 10: flashing text alert
 bool testAlertOn = false;
-String testInjectedBody;        // JSON body injected by test script
-bool   testHasInjection = false; // new injection waiting to be processed
+String testInjectedBody;
+bool   testHasInjection = false;
 bool tlsOK = false;
 unsigned long lastPoll = 0;
 bool displayToggle = true;
 String mySSID;
 String myIP;
 std::vector<String> monitoredCities;
-String alertMatchCity;         // matched city name (Hebrew)
-String alertTitle;             // e.g. "ירי רקטות וטילים"
-String alertDesc;              // e.g. "היכנסו למרחב המוגן ושהו בו 10 דקות"
-int    alertCat = 0;           // category number
+String alertMatchCity;
+String alertTitle;
+String alertDesc;
+int    alertCat = 0;
 String scanResultsHTML;
 unsigned long lastDisplaySwitch = 0;
 int cityScrollOffset = 0;
 bool showCityList = false;
 unsigned long lastFlashToggle = 0;
+
+// ===== Alert State Machine =====
+enum AlertState { STATE_IDLE = 0, STATE_WARNING = 1, STATE_SHELTER = 2, STATE_CLEAR = 3 };
+AlertState alertState = STATE_IDLE;
+unsigned long stateChangedAt = 0;
+int sirenCount = 0;
+bool sirenSilenced = false;
+static const int MAX_SIREN_PLAYS = 1;
+static const unsigned long CLEAR_TIMEOUT_MS = 60000;
+
+const char* stateLabel(AlertState s) {
+    switch(s) {
+        case STATE_WARNING: return "Warning";
+        case STATE_SHELTER: return "Shelter!";
+        case STATE_CLEAR:   return "Clear";
+        default:            return "Idle";
+    }
+}
+
+// Classify alert title -> state (based on real Pikud HaOref messages)
+AlertState classifyAlert(const String& title) {
+    // cat=1: ירי רקטות / חדירת כלי טיס / רעידת אדמה / חומרים מסוכנים / חדירת מחבלים
+    if (title.indexOf("\xD7\x99\xD7\xA8\xD7\x99 \xD7\xA8\xD7\xA7\xD7\x98\xD7\x95\xD7\xAA") >= 0) return STATE_SHELTER;
+    if (title.indexOf("\xD7\x97\xD7\x93\xD7\x99\xD7\xA8\xD7\xAA") >= 0) return STATE_SHELTER;
+    if (title.indexOf("\xD7\xA8\xD7\xA2\xD7\x99\xD7\x93\xD7\xAA") >= 0) return STATE_SHELTER;
+    if (title.indexOf("\xD7\x97\xD7\x95\xD7\x9E\xD7\xA8\xD7\x99\xD7\x9D") >= 0) return STATE_SHELTER;
+    // cat=10 warning: בדקות הקרובות / התרעה מוקדמת
+    if (title.indexOf("\xD7\x91\xD7\x93\xD7\xA7\xD7\x95\xD7\xAA \xD7\x94\xD7\xA7\xD7\xA8\xD7\x95\xD7\x91\xD7\x95\xD7\xAA") >= 0) return STATE_WARNING;
+    if (title.indexOf("\xD7\x94\xD7\xAA\xD7\xA8\xD7\xA2\xD7\x94 \xD7\x9E\xD7\x95\xD7\xA7\xD7\x93\xD7\x9E\xD7\xAA") >= 0) return STATE_WARNING;
+    // cat=10 clear: האירוע הסתיים
+    if (title.indexOf("\xD7\x94\xD7\x90\xD7\x99\xD7\xA8\xD7\x95\xD7\xA2 \xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D") >= 0) return STATE_CLEAR;
+    // Fallback: any cat 1-7,13 -> SHELTER, cat 10 -> WARNING
+    return STATE_IDLE;  // unknown, caller handles cat-based fallback
+}
 
 // ===== Time helpers =====
 void initNTP() {
@@ -166,18 +199,31 @@ void buzz(int ms, int freq) {
     buzzOff();
 }
 
-void siren() {
-    // Nokia ringtone melody in high pitch
-    int melody[] =  {2637,2637,0,2637,0,2093,2637,0,3136,0,0,0,1568,0,0,0};
-    int durations[]={120, 120,120,120,120,120, 120,120,120,120,120,240,120,120,120,240};
-    for (int i = 0; i < 16; i++) {
-        if (melody[i] > 0) {
-            buzz(durations[i], melody[i]);
-        } else {
-            delay(durations[i]);
+// Mario "E LA mama" tune - plays 2 times, returns true if button pressed
+bool marioSiren() {
+    // Short Mario-style motif: E5(mi) - A4(la) - A4 A4 (mama)
+    struct Note { int freq; int dur; };
+    Note phrase[] = {
+        {659, 200}, {0, 60},   // E
+        {440, 200}, {0, 60},   // LA
+        {440, 120}, {0, 40},   // ma
+        {440, 120}, {0, 40},   // ma
+        {0, 200},              // rest between repeats
+    };
+    int phraseLen = sizeof(phrase) / sizeof(phrase[0]);
+    for (int rep = 0; rep < 2; rep++) {
+        for (int i = 0; i < phraseLen; i++) {
+            if (digitalRead(BTN_PIN) == LOW) { buzzOff(); return true; }
+            srv.handleClient();  // keep web server responsive
+            if (phrase[i].freq > 0) {
+                buzz(phrase[i].dur, phrase[i].freq);
+            } else {
+                delay(phrase[i].dur);
+            }
         }
-        delay(20);
     }
+    buzzOff();
+    return false;
 }
 
 void startupBeep() {
@@ -382,13 +428,23 @@ void startAP() {
 // ===== Alert State Management =====
 
 void clearAlertState() {
-    alertActive = false;
-    newsFlashActive = false;
+    alertState = STATE_IDLE;
     alertCat = 0;
     alertTitle = "";
     alertDesc = "";
     alertMatchCity = "";
+    sirenCount = 0;
+    sirenSilenced = true;
     buzzOff();
+}
+
+void changeState(AlertState newState) {
+    if (newState == alertState) return;  // dedup: same message -> no re-trigger
+    Serial.printf("STATE: %s -> %s\n", stateLabel(alertState), stateLabel(newState));
+    alertState = newState;
+    stateChangedAt = millis();
+    sirenCount = 0;
+    sirenSilenced = false;
 }
 
 // ===== CSS & HTML helpers =====
@@ -408,7 +464,25 @@ input[type=checkbox]{width:18px;height:18px;margin-left:8px}
 .del-btn{background:#c0392b;width:auto;padding:4px 12px;font-size:13px;margin-right:8px}
 .test-btn{background:#ff9800}.test-btn:hover{background:#e68a00}
 .scroll{max-height:300px;overflow-y:auto;background:#0f1a30;padding:8px;border-radius:4px}
+.state-box{text-align:center;padding:20px;border-radius:8px;margin:10px 0}
+.state-idle{background:#16213e;border:2px solid #444}
+.state-warn{background:#3d2100;border:3px solid #ff9800}
+.state-shelter{background:#3d0000;border:3px solid #e94560}
+.state-clear{background:#003d10;border:3px solid #2ecc71}
 </style>)rawliteral";
+
+String stateHTML() {
+    String css, heb, lbl;
+    switch(alertState) {
+        case STATE_SHELTER: css="state-shelter"; heb="\xD7\x9C\xD7\x9E\xD7\xA7\xD7\x9C\xD7\x98!"; lbl="SHELTER"; break;
+        case STATE_WARNING: css="state-warn"; heb="\xD7\x94\xD7\xAA\xD7\xA8\xD7\xA2\xD7\x94"; lbl="WARNING"; break;
+        case STATE_CLEAR:   css="state-clear"; heb="\xD7\x9C\xD7\xA6\xD7\x90\xD7\xAA"; lbl="CLEAR"; break;
+        default:            css="state-idle"; heb="\xD7\xAA\xD7\xA7\xD7\x99\xD7\x9F"; lbl="IDLE"; break;
+    }
+    return "<div class=\"state-box " + css + "\">"
+        "<h1 style=\"font-size:64px;margin:0\">" + heb + "</h1>"
+        "<p style=\"font-size:18px;margin:5px 0\">" + lbl + "</p></div>";
+}
 
 static const char NAV[] = R"rawliteral(<nav><a href="/">Home</a><a href="/wifi">WiFi</a><a href="/areas">Areas</a><a href="/log">Log</a><a href="/test_page">Test</a></nav><hr>)rawliteral";
 
@@ -432,11 +506,13 @@ void handleHome() {
         ? "<button style=\"background:#2ecc71\">Day Mode (screen on)</button>"
         : "<button style=\"background:#555\">Night Mode (screen off)</button>";
     String html = htmlHead("Emergency Alerts")
+        + "<meta http-equiv=\"refresh\" content=\"5\">"
         + "<h1>Emergency Alerts</h1>" + NAV
+        + stateHTML()
         + "<div class=\"card\"><h2>Status</h2>"
         + "<p>Connected to: <b>" + mySSID + "</b></p>"
         + "<p>Monitoring: <b>" + String(n) + " area(s)</b></p>"
-        + "<p>Status: <b>" + (tlsOK ? "Online" : "Offline") + "</b></p>"
+        + "<p>Status: <b>" + (testAlertOn ? "<span style=\"color:#ff9800\">TEST MODE</span>" : (tlsOK ? "Online" : "Offline")) + "</b></p>"
         + "<p>Display: <b>" + (nightMode ? "Night" : "Day") + "</b></p>"
         + "<form method=\"POST\" action=\"/night\">" + nightBtn + "</form></div>"
         + "</body></html>";
@@ -718,19 +794,25 @@ void handleNightToggle() {
 void handleTestPage() {
     String status = testAlertOn ? "ACTIVE - listening for injected alerts" : "Inactive";
     String html = htmlHead("Test")
+        + "<meta http-equiv=\"refresh\" content=\"5\">"
         + "<h1>Test Mode</h1>" + NAV
+        + stateHTML()
         + "<div class=\"card\"><p>Test mode: <b>" + status + "</b></p>"
-        + "<form method=\"POST\" action=\"/test\">"
-        + "<button type=\"submit\" class=\"test-btn\">" + (testAlertOn ? "Already Active" : "Enter Test Mode") + "</button></form>"
+        + "<form method=\"POST\" action=\"/test_quick\">"
+        + "<select name=\"type\" style=\"width:100%;margin-bottom:8px\">"
+        + "<option value=\"warn\">\xD7\x94\xD7\xAA\xD7\xA8\xD7\xA2\xD7\x94 (Warning)</option>"
+        + "<option value=\"shelter\">\xD7\x9C\xD7\x9E\xD7\xA7\xD7\x9C\xD7\x98 (Shelter)</option>"
+        + "<option value=\"clear\">\xD7\x9C\xD7\xA6\xD7\x90\xD7\xAA (Clear)</option>"
+        + "</select>"
+        + "<button type=\"submit\" class=\"test-btn\">Quick Test</button></form>"
         + "<form method=\"POST\" action=\"/clear_test\">"
-        + "<button type=\"submit\" style=\"background:#555;margin-top:5px\">Exit Test Mode</button></form>"
+        + "<button type=\"submit\" style=\"background:#555;margin-top:5px\">Reset to Idle</button></form>"
         + "</div>"
-        + "<div class=\"card\"><h2>Instructions</h2>"
-        + "<p>1. Enter test mode above</p>"
-        + "<p>2. On your laptop, run:</p>"
-        + "<pre style=\"background:#0f1a30;padding:10px;border-radius:4px;overflow-x:auto\">python test_alerts.py " + myIP + "</pre>"
-        + "<p>3. Choose alert scenario from the menu</p>"
-        + "<p>4. The device will react as if it were a real alert</p>"
+        + "<div class=\"card\"><h2>Inject Mode</h2>"
+        + "<p>1. Enter test mode, 2. Run:<br>"
+        + "<code>python test_alerts.py " + myIP + "</code></p>"
+        + "<form method=\"POST\" action=\"" + String(testAlertOn ? "/clear_test" : "/test") + "\">"
+        + "<button type=\"submit\" style=\"" + String(testAlertOn ? "background:#555" : "background:#ff9800") + "\">" + (testAlertOn ? "End Inject Mode" : "Enter Inject Mode") + "</button></form>"
         + "</div>"
         + "<div class=\"card\"><form action=\"/reset_all\" method=\"POST\">"
         + "<button style=\"background:#c0392b\">Factory Reset</button>"
@@ -751,6 +833,29 @@ void handleClearTest() {
     testHasInjection = false;
     testInjectedBody = "";
     clearAlertState();
+    sendRedirect("/test_page");
+}
+
+void handleTestQuick() {
+    String type = srv.arg("type");
+    AlertState newState = STATE_IDLE;
+    if (type == "shelter") {
+        alertTitle = "\xD7\x99\xD7\xA8\xD7\x99 \xD7\xA8\xD7\xA7\xD7\x98\xD7\x95\xD7\xAA \xD7\x95\xD7\x98\xD7\x99\xD7\x9C\xD7\x99\xD7\x9D";
+        alertCat = 1;
+        newState = STATE_SHELTER;
+    } else if (type == "clear") {
+        alertTitle = "\xD7\x94\xD7\x90\xD7\x99\xD7\xA8\xD7\x95\xD7\xA2 \xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D";
+        alertCat = 10;
+        newState = STATE_CLEAR;
+    } else {
+        alertTitle = "\xD7\x91\xD7\x93\xD7\xA7\xD7\x95\xD7\xAA \xD7\x94\xD7\xA7\xD7\xA8\xD7\x95\xD7\x91\xD7\x95\xD7\xAA \xD7\xA6\xD7\xA4\xD7\x95\xD7\x99\xD7\x95\xD7\xAA \xD7\x9C\xD7\x94\xD7\xAA\xD7\xA7\xD7\x91\xD7\x9C \xD7\x94\xD7\xAA\xD7\xA8\xD7\xA2\xD7\x95\xD7\xAA";
+        alertCat = 10;
+        newState = STATE_WARNING;
+    }
+    alertMatchCity = "Test";
+    alertDesc = "Test";
+    changeState(newState);
+    addAlertLog(alertCat, alertTitle, alertDesc, alertMatchCity);
     sendRedirect("/test_page");
 }
 
@@ -1083,6 +1188,7 @@ void setup() {
     srv.on("/night", HTTP_POST, handleNightToggle);
     srv.on("/test_page", handleTestPage);
     srv.on("/test", HTTP_POST, handleTest);
+    srv.on("/test_quick", HTTP_POST, handleTestQuick);
     srv.on("/test_inject", HTTP_POST, handleTestInject);
     srv.on("/clear_test", HTTP_POST, handleClearTest);
     srv.on("/reset_all", HTTP_POST, handleResetAll);
@@ -1102,26 +1208,26 @@ void loop() {
         return;
     }
 
-    // Poll alerts
     unsigned long now = millis();
+
+    // ===== 1. Poll alerts =====
     if (now - lastPoll > POLL_MS) {
         lastPoll = now;
 
         int cat = 0;
         if (testAlertOn) {
-            // In test mode: process injected JSON or keep current state
+            // In test mode: process injected JSON
             if (testHasInjection) {
                 testHasInjection = false;
                 String body = testInjectedBody;
                 body.trim();
                 if (body.isEmpty() || body == "\"\"" || body == "{}" || body == "[]") {
-                    // Empty injection = clear alert
-                    cat = 0;
-                    if (alertActive || newsFlashActive) {
-                        Serial.println("Test: alert cleared by empty injection");
+                    // Empty payload -> reset to idle
+                    if (alertState != STATE_IDLE) {
+                        Serial.println("Test inject: empty payload -> IDLE");
                         clearAlertState();
-                        buzz(100, 440);
                     }
+                    cat = 0;
                 } else {
                     JsonDocument doc;
                     if (!deserializeJson(doc, body)
@@ -1138,112 +1244,58 @@ void loop() {
                     }
                 }
             }
-            // If no new injection, keep cat=0 so existing state persists
         } else {
             cat = pollAlerts();
         }
 
         if (cat > 0) {
-            if (cat == 10) {
-                // NewsFlash: check if event ended / safe to leave shelter
-                bool isEventOver = alertTitle.indexOf("\xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D") >= 0
-                    || alertDesc.indexOf("\xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D") >= 0
-                    || alertDesc.indexOf("\xD7\xA0\xD7\x99\xD7\xAA\xD7\x9F \xD7\x9C\xD7\xA6\xD7\x90\xD7\xAA") >= 0
-                    || alertTitle.indexOf("\xD7\xA0\xD7\x99\xD7\xAA\xD7\x9F \xD7\x9C\xD7\xA6\xD7\x90\xD7\xAA") >= 0;
-                if (isEventOver) {
-                    // "הסתיים" or "ניתן לצאת" found -> event over / safe to leave
-                    addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
-                    Serial.println("Event ended / safe to leave shelter");
-                    clearAlertState();
-                    buzz(200, 300);
-                } else {
-                    // Active newsFlash
-                    newsFlashActive = true;
-                    alertActive = false;
-                    addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
-                    Serial.println("NEWSFLASH: " + alertTitle);
-                }
-            } else if ((cat >= 1 && cat <= 7) || cat == 13) {
-                // Siren alert
-                if (!alertActive) {
-                    alertActive = true;
-                    newsFlashActive = false;
-                    addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
-                    Serial.println("SIREN ALERT cat=" + String(cat));
-                }
+            // Classify by title first
+            AlertState newState = classifyAlert(alertTitle);
+            // Fallback by category number
+            if (newState == STATE_IDLE) {
+                if ((cat >= 1 && cat <= 7) || cat == 13) newState = STATE_SHELTER;
+                else if (cat == 10) newState = STATE_WARNING;
             }
-        } else if (!testAlertOn) {
-            // No alert data from API
-            if (alertActive || newsFlashActive) {
-                Serial.println("Alert cleared by API");
-                clearAlertState();
-                buzz(100, 440);
+
+            if (newState != STATE_IDLE && newState != alertState) {
+                addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
+                changeState(newState);
             }
         }
     }
 
-    // ===== Display =====
-    if (alertActive) {
-        // Siren alert display: show title, city, desc in Hebrew
-        displayToggle = !displayToggle;
+    // ===== 2. Auto-clear CLEAR state after 60 seconds =====
+    if (alertState == STATE_CLEAR) {
+        if (now - stateChangedAt > CLEAR_TIMEOUT_MS) {
+            Serial.println("CLEAR expired -> IDLE");
+            clearAlertState();
+        }
+    }
+
+    // ===== 3. Display =====
+    if (alertState == STATE_SHELTER) {
         oled.clearBuffer();
-        oled.setFont(u8g2_font_6x10_tf);
-        oled.drawStr(0, 10, "!! ALERT !!");
-        // Show alert title in Hebrew (e.g. ירי רקטות וטילים)
-        oled.setFont(u8g2_font_unifont_t_hebrew);
-        String revTitle = reverseUTF8(alertTitle);
-        int tw = oled.getUTF8Width(revTitle.c_str());
-        oled.drawUTF8(128 - tw, 26, revTitle.c_str());
-        // Show city name in Hebrew
-        String revCity = reverseUTF8(alertMatchCity);
-        int cw = oled.getUTF8Width(revCity.c_str());
-        oled.drawUTF8(128 - cw, 42, revCity.c_str());
-        // Show desc (shelter instructions)
-        oled.setFont(u8g2_font_6x10_tf);
-        if (displayToggle) {
-            // Truncate desc for display
-            String d = alertDesc.substring(0, 21);
-            oled.drawStr(0, 56, d.c_str());
-        } else {
-            oled.drawStr(0, 56, "Press btn to dismiss");
-        }
+        oled.drawXBM(0, 0, 128, 64, bmp_lamiklat);
         oled.sendBuffer();
-
-    } else if (newsFlashActive) {
-        // NewsFlash: flash screen (0.5s white / 0.5s text)
-        unsigned long now3 = millis();
-        if (now3 - lastFlashToggle > 500) {
-            lastFlashToggle = now3;
-            displayToggle = !displayToggle;
-        }
-        if (displayToggle) {
-            // Full white screen (inverted)
+    } else if (alertState == STATE_WARNING) {
+        // Flash the bitmap on/off every 500ms
+        if ((now / 500) % 2 == 0) {
             oled.clearBuffer();
-            oled.drawBox(0, 0, 128, 64);
+            oled.drawXBM(0, 0, 128, 64, bmp_hatraa);
             oled.sendBuffer();
         } else {
-            // Show message text and city
             oled.clearBuffer();
-            oled.setFont(u8g2_font_6x10_tf);
-            oled.drawStr(0, 10, "-- NEWS FLASH --");
-            oled.setFont(u8g2_font_unifont_t_hebrew);
-            String revTitle = reverseUTF8(alertTitle);
-            int tw = oled.getUTF8Width(revTitle.c_str());
-            oled.drawUTF8(128 - tw, 28, revTitle.c_str());
-            String revCity = reverseUTF8(alertMatchCity);
-            int cw = oled.getUTF8Width(revCity.c_str());
-            oled.drawUTF8(128 - cw, 46, revCity.c_str());
-            oled.setFont(u8g2_font_6x10_tf);
-            oled.drawStr(0, 60, "Press btn to dismiss");
             oled.sendBuffer();
         }
-
+    } else if (alertState == STATE_CLEAR) {
+        oled.clearBuffer();
+        oled.drawXBM(0, 0, 128, 64, bmp_latzet);
+        oled.sendBuffer();
     } else if (nightMode) {
-        // Night mode: blank screen
         oled.clearBuffer();
         oled.sendBuffer();
     } else {
-        // Normal mode: status / city list
+        // Normal idle: status / city list
         unsigned long now2 = millis();
         if (now2 - lastDisplaySwitch > 4000) {
             lastDisplaySwitch = now2;
@@ -1273,22 +1325,40 @@ void loop() {
         }
     }
 
-    // Alarm sound (only for siren alerts, not newsFlash)
-    if (alertActive) {
-        siren();
+    // ===== 4. Sound: Mario tune for SHELTER (plays once ~5s), no sound for WARNING =====
+    if (alertState == STATE_SHELTER && !sirenSilenced) {
+        if (sirenCount < MAX_SIREN_PLAYS) {
+            bool pressed = marioSiren();
+            if (pressed) {
+                sirenSilenced = true;
+                buzzOff();
+                while (digitalRead(BTN_PIN) == LOW) delay(50);
+                delay(300);
+            } else {
+                sirenCount++;
+                if (sirenCount >= MAX_SIREN_PLAYS) {
+                    sirenSilenced = true;
+                }
+            }
+        } else {
+            delay(100);
+        }
+    } else if (alertState == STATE_CLEAR && !sirenSilenced) {
+        buzz(200, 880);
+        delay(100);
+        buzz(200, 880);
+        sirenSilenced = true;
     } else {
         delay(100);
     }
 
-    // Button: dismiss alert entirely (siren or newsFlash)
-    if (digitalRead(BTN_PIN) == LOW) {
-        if (alertActive || newsFlashActive) {
-            Serial.println("Button pressed - dismissing alert");
-            clearAlertState();
-            testAlertOn = false;
-            show6("Alert dismissed");
-            buzz(50, 440);
-            delay(500);
+    // ===== 5. Button: just stop buzzer (no state change) =====
+    if (digitalRead(BTN_PIN) == LOW && !sirenSilenced) {
+        if (alertState == STATE_SHELTER) {
+            sirenSilenced = true;
+            buzzOff();
+            while (digitalRead(BTN_PIN) == LOW) delay(50);
+            delay(300);
         }
     }
 }
