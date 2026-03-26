@@ -49,6 +49,7 @@ static const char* WIFI_FILE  = "/wifi_config.json";
 static const char* AREAS_CFG  = "/alert_areas.json";
 static const char* AREAS_REF  = "/areas.json";
 static const char* NAMES_FILE = "/area_names.json";
+static const char* SETTINGS_FILE = "/settings.json";
 static const unsigned long POLL_MS = 3000;
 
 // ===== Globals =====
@@ -81,8 +82,12 @@ AlertState alertState = STATE_IDLE;
 unsigned long stateChangedAt = 0;
 int sirenCount = 0;
 bool sirenSilenced = false;
-static const int MAX_SIREN_PLAYS = 1;
 static const unsigned long CLEAR_TIMEOUT_MS = 60000;
+
+// ===== User Settings (persisted to LittleFS) =====
+int cfgAlarmType = 0;      // 0 = La Mama, 1 = Mario
+int cfgAlarmRepeats = 1;   // 1-99
+bool cfgDefaultNight = false; // default night mode on power-on
 
 const char* stateLabel(AlertState s) {
     switch(s) {
@@ -199,9 +204,8 @@ void buzz(int ms, int freq) {
     buzzOff();
 }
 
-// Mario "E LA mama" tune - plays 2 times, returns true if button pressed
-bool marioSiren() {
-    // Short Mario-style motif: E5(mi) - A4(la) - A4 A4 (mama)
+// "E LA mama" tune - plays once, returns true if button pressed
+bool laMamaSiren() {
     struct Note { int freq; int dur; };
     Note phrase[] = {
         {659, 200}, {0, 60},   // E
@@ -211,19 +215,45 @@ bool marioSiren() {
         {0, 200},              // rest between repeats
     };
     int phraseLen = sizeof(phrase) / sizeof(phrase[0]);
-    for (int rep = 0; rep < 2; rep++) {
-        for (int i = 0; i < phraseLen; i++) {
-            if (digitalRead(BTN_PIN) == LOW) { buzzOff(); return true; }
-            srv.handleClient();  // keep web server responsive
-            if (phrase[i].freq > 0) {
-                buzz(phrase[i].dur, phrase[i].freq);
-            } else {
-                delay(phrase[i].dur);
-            }
+    for (int i = 0; i < phraseLen; i++) {
+        if (digitalRead(BTN_PIN) == LOW) { buzzOff(); return true; }
+        srv.handleClient();
+        if (phrase[i].freq > 0) {
+            buzz(phrase[i].dur, phrase[i].freq);
+        } else {
+            delay(phrase[i].dur);
         }
     }
     buzzOff();
     return false;
+}
+
+// Mario Bros theme tune - plays once, returns true if button pressed
+bool marioSiren() {
+    struct Note { int freq; int dur; };
+    Note melody[] = {
+        {2637,120},{2637,120},{0,120},{2637,120},{0,120},{2093,120},{2637,120},{0,120},
+        {3136,120},{0,120},{0,120},{0,240},{1568,120},{0,120},{0,120},{0,240},
+    };
+    int len = sizeof(melody) / sizeof(melody[0]);
+    for (int i = 0; i < len; i++) {
+        if (digitalRead(BTN_PIN) == LOW) { buzzOff(); return true; }
+        srv.handleClient();
+        if (melody[i].freq > 0) {
+            buzz(melody[i].dur, melody[i].freq);
+        } else {
+            delay(melody[i].dur);
+        }
+        delay(20);
+    }
+    buzzOff();
+    return false;
+}
+
+// Play the configured alarm, returns true if button pressed
+bool playAlarm() {
+    if (cfgAlarmType == 1) return marioSiren();
+    return laMamaSiren();
 }
 
 void startupBeep() {
@@ -318,6 +348,29 @@ void saveAlertCfg(const JsonDocument& doc) {
     if (f) { serializeJson(doc, f); f.close(); }
 }
 
+// ===== Settings I/O =====
+
+void loadSettings() {
+    File f = LittleFS.open(SETTINGS_FILE, "r");
+    if (!f) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, f)) { f.close(); return; }
+    f.close();
+    if (doc["alarmType"].is<int>()) cfgAlarmType = doc["alarmType"].as<int>();
+    if (doc["alarmRepeats"].is<int>()) { int v = doc["alarmRepeats"].as<int>(); cfgAlarmRepeats = v < 1 ? 1 : v; }
+    if (doc["defaultNight"].is<bool>()) cfgDefaultNight = doc["defaultNight"].as<bool>();
+    Serial.printf("Settings: alarmType=%d repeats=%d defaultNight=%d\n", cfgAlarmType, cfgAlarmRepeats, cfgDefaultNight);
+}
+
+void saveSettings() {
+    JsonDocument doc;
+    doc["alarmType"] = cfgAlarmType;
+    doc["alarmRepeats"] = cfgAlarmRepeats;
+    doc["defaultNight"] = cfgDefaultNight;
+    File f = LittleFS.open(SETTINGS_FILE, "w");
+    if (f) { serializeJson(doc, f); f.close(); }
+}
+
 std::vector<String> loadAreaNames() {
     std::vector<String> names;
     File f = LittleFS.open(NAMES_FILE, "r");
@@ -350,6 +403,7 @@ std::vector<String> loadAreaCities(const String& areaName) {
 void clearAllConfig() {
     LittleFS.remove(WIFI_FILE);
     LittleFS.remove(AREAS_CFG);
+    LittleFS.remove(SETTINGS_FILE);
 }
 
 // ===== Monitored Cities Cache =====
@@ -484,7 +538,7 @@ String stateHTML() {
         "<p style=\"font-size:18px;margin:5px 0\">" + lbl + "</p></div>";
 }
 
-static const char NAV[] = R"rawliteral(<nav><a href="/">Home</a><a href="/wifi">WiFi</a><a href="/areas">Areas</a><a href="/log">Log</a><a href="/test_page">Test</a></nav><hr>)rawliteral";
+static const char NAV[] = R"rawliteral(<nav><a href="/">Home</a><a href="/wifi">WiFi</a><a href="/areas">Areas</a><a href="/settings">Settings</a><a href="/log">Log</a><a href="/test_page">Test</a></nav><hr>)rawliteral";
 
 String htmlHead(const char* title) {
     return String("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
@@ -709,6 +763,43 @@ void handleClearAreas() {
     sendRedirect("/areas");
 }
 
+// ===== Web Handlers: Settings =====
+
+void handleSettings() {
+    String lamamaSel = (cfgAlarmType == 0) ? " selected" : "";
+    String marioSel = (cfgAlarmType == 1) ? " selected" : "";
+    String nightChecked = cfgDefaultNight ? " checked" : "";
+    String html = htmlHead("Settings")
+        + "<h1>Settings</h1>" + NAV
+        + "<form method=\"POST\" action=\"/save_settings\">"
+        + "<div class=\"card\"><h2>Alarm Sound</h2>"
+        + "<label>Alarm type:</label>"
+        + "<select name=\"alarmType\" style=\"width:100%\">"
+        + "<option value=\"0\"" + lamamaSel + ">La Mama (E-LA-mama)</option>"
+        + "<option value=\"1\"" + marioSel + ">Mario (classic theme)</option>"
+        + "</select></div>"
+        + "<div class=\"card\"><h2>Alarm Repeats</h2>"
+        + "<label>How many times to play (1 or more):</label>"
+        + "<input type=\"number\" name=\"alarmRepeats\" min=\"1\" value=\"" + String(cfgAlarmRepeats) + "\" style=\"width:100%\">"
+        + "</div>"
+        + "<div class=\"card\"><h2>Display</h2>"
+        + "<label class=\"item\"><input type=\"checkbox\" name=\"defaultNight\" value=\"1\"" + nightChecked + "> Start in Night Mode on power-on</label>"
+        + "</div>"
+        + "<button type=\"submit\">Save Settings</button>"
+        + "</form></body></html>";
+    srv.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleSaveSettings() {
+    cfgAlarmType = srv.arg("alarmType").toInt();
+    if (cfgAlarmType < 0 || cfgAlarmType > 1) cfgAlarmType = 0;
+    { int v = srv.arg("alarmRepeats").toInt(); cfgAlarmRepeats = v < 1 ? 1 : v; }
+    cfgDefaultNight = srv.hasArg("defaultNight");
+    saveSettings();
+    Serial.printf("Settings saved: alarm=%d repeats=%d night=%d\n", cfgAlarmType, cfgAlarmRepeats, cfgDefaultNight);
+    sendRedirect("/settings");
+}
+
 // ===== Web Handlers: Test =====
 
 void handleLog() {
@@ -838,22 +929,32 @@ void handleClearTest() {
 
 void handleTestQuick() {
     String type = srv.arg("type");
+
+    // Use first monitored city
+    if (monitoredCities.empty()) {
+        srv.send(400, "text/plain", "No monitored cities configured");
+        return;
+    }
+    String city = monitoredCities[0];
+
     AlertState newState = STATE_IDLE;
     if (type == "shelter") {
         alertTitle = "\xD7\x99\xD7\xA8\xD7\x99 \xD7\xA8\xD7\xA7\xD7\x98\xD7\x95\xD7\xAA \xD7\x95\xD7\x98\xD7\x99\xD7\x9C\xD7\x99\xD7\x9D";
+        alertDesc = "\xD7\x94\xD7\x99\xD7\x9B\xD7\xA0\xD7\xA1\xD7\x95 \xD7\x9C\xD7\x9E\xD7\xA8\xD7\x97\xD7\x91 \xD7\x94\xD7\x9E\xD7\x95\xD7\x92\xD7\x9F";
         alertCat = 1;
         newState = STATE_SHELTER;
     } else if (type == "clear") {
         alertTitle = "\xD7\x94\xD7\x90\xD7\x99\xD7\xA8\xD7\x95\xD7\xA2 \xD7\x94\xD7\xA1\xD7\xAA\xD7\x99\xD7\x99\xD7\x9D";
+        alertDesc = "\xD7\x94\xD7\xA9\xD7\x95\xD7\x94\xD7\x99\xD7\x9D \xD7\x91\xD7\x9E\xD7\xA8\xD7\x97\xD7\x91 \xD7\x94\xD7\x9E\xD7\x95\xD7\x92\xD7\x9F \xD7\x99\xD7\x9B\xD7\x95\xD7\x9C\xD7\x99\xD7\x9D \xD7\x9C\xD7\xA6\xD7\x90\xD7\xAA";
         alertCat = 10;
         newState = STATE_CLEAR;
     } else {
-        alertTitle = "\xD7\x91\xD7\x93\xD7\xA7\xD7\x95\xD7\xAA \xD7\x94\xD7\xA7\xD7\xA8\xD7\x95\xD7\x91\xD7\x95\xD7\xAA \xD7\xA6\xD7\xA4\xD7\x95\xD7\x99\xD7\x95\xD7\xAA \xD7\x9C\xD7\x94\xD7\xAA\xD7\xA7\xD7\x91\xD7\x9C \xD7\x94\xD7\xAA\xD7\xA8\xD7\xA2\xD7\x95\xD7\xAA";
+        alertTitle = "\xD7\x91\xD7\x93\xD7\xA7\xD7\x95\xD7\xAA \xD7\x94\xD7\xA7\xD7\xA8\xD7\x95\xD7\x91\xD7\x95\xD7\xAA \xD7\xA6\xD7\xA4\xD7\x95\xD7\x99\xD7\x95\xD7\xAA \xD7\x9C\xD7\x94\xD7\xAA\xD7\xA7\xD7\x91\xD7\x9C \xD7\x94\xD7\xAA\xD7\xA8\xD7\xA2\xD7\x95\xD7\xAA \xD7\x91\xD7\x90\xD7\x96\xD7\x95\xD7\xA8\xD7\x9A";
+        alertDesc = "\xD7\xA2\xD7\x9C \xD7\xAA\xD7\x95\xD7\xA9\xD7\x91\xD7\x99 \xD7\x94\xD7\x90\xD7\x96\xD7\x95\xD7\xA8\xD7\x99\xD7\x9D \xD7\x94\xD7\x91\xD7\x90\xD7\x99\xD7\x9D \xD7\x9C\xD7\xA9\xD7\xA4\xD7\xA8 \xD7\x90\xD7\xAA \xD7\x94\xD7\x9E\xD7\x99\xD7\xA7\xD7\x95\xD7\x9D \xD7\x9C\xD7\x9E\xD7\x99\xD7\x92\xD7\x95\xD7\x9F \xD7\x94\xD7\x9E\xD7\x99\xD7\x98\xD7\x91\xD7\x99 \xD7\x91\xD7\xA7\xD7\xA8\xD7\x91\xD7\xAA\xD7\x9A";
         alertCat = 10;
         newState = STATE_WARNING;
     }
-    alertMatchCity = "Test";
-    alertDesc = "Test";
+    alertMatchCity = city;
     changeState(newState);
     addAlertLog(alertCat, alertTitle, alertDesc, alertMatchCity);
     sendRedirect("/test_page");
@@ -1110,6 +1211,10 @@ void setup() {
         if (f) f.close();
     }
 
+    // Load user settings and apply default night mode
+    loadSettings();
+    nightMode = cfgDefaultNight;
+
     show6("Emergency Alert", "", "Hold btn 3s", "to reset cfg");
     delay(500);
 
@@ -1182,6 +1287,8 @@ void setup() {
     srv.on("/save_area", HTTP_POST, handleSaveArea);
     srv.on("/area_off", HTTP_POST, handleAreaOff);
     srv.on("/clear_areas", HTTP_POST, handleClearAreas);
+    srv.on("/settings", handleSettings);
+    srv.on("/save_settings", HTTP_POST, handleSaveSettings);
     srv.on("/log", handleLog);
     srv.on("/log_download", handleLogDownload);
     srv.on("/log_clear", HTTP_POST, handleLogClear);
@@ -1210,57 +1317,68 @@ void loop() {
 
     unsigned long now = millis();
 
-    // ===== 1. Poll alerts =====
-    if (now - lastPoll > POLL_MS) {
-        lastPoll = now;
+    // ===== 1. Poll / process alerts =====
+    int cat = 0;
 
-        int cat = 0;
-        if (testAlertOn) {
-            // In test mode: process injected JSON
-            if (testHasInjection) {
-                testHasInjection = false;
-                String body = testInjectedBody;
-                body.trim();
-                if (body.isEmpty() || body == "\"\"" || body == "{}" || body == "[]") {
-                    // Empty payload -> reset to idle
-                    if (alertState != STATE_IDLE) {
-                        Serial.println("Test inject: empty payload -> IDLE");
-                        clearAlertState();
-                    }
-                    cat = 0;
-                } else {
-                    JsonDocument doc;
-                    if (!deserializeJson(doc, body)
-                        && doc["data"].is<JsonArray>()
-                        && doc["data"].as<JsonArray>().size() > 0) {
-                        cat = doc["cat"].as<int>();
-                        if (cat == 0 && doc["cat"].is<const char*>())
-                            cat = atoi(doc["cat"].as<const char*>());
-                        alertCat = cat;
-                        alertTitle = doc["title"].as<String>();
-                        alertDesc = doc["desc"].as<String>();
-                        alertMatchCity = doc["data"][0].as<String>();
-                        Serial.printf("Test inject cat=%d city=%s\n", cat, alertMatchCity.c_str());
-                    }
-                }
+    if (testAlertOn && testHasInjection) {
+        // Process test injections IMMEDIATELY (don't wait for poll timer)
+        testHasInjection = false;
+        String body = testInjectedBody;
+        body.trim();
+        if (body.isEmpty() || body == "\"\"" || body == "{}" || body == "[]") {
+            if (alertState != STATE_IDLE) {
+                Serial.println("Test inject: empty payload -> IDLE");
+                clearAlertState();
             }
         } else {
-            cat = pollAlerts();
+            JsonDocument doc;
+            if (!deserializeJson(doc, body)
+                && doc["data"].is<JsonArray>()
+                && doc["data"].as<JsonArray>().size() > 0) {
+                int c = doc["cat"].as<int>();
+                if (c == 0 && doc["cat"].is<const char*>())
+                    c = atoi(doc["cat"].as<const char*>());
+                String title = doc["title"].as<String>();
+                String desc = doc["desc"].as<String>();
+
+                // Match against monitored cities (same as pollAlerts)
+                for (JsonVariant ac : doc["data"].as<JsonArray>()) {
+                    String city = ac.as<String>();
+                    for (int i = 0; i < (int)monitoredCities.size(); i++) {
+                        if (city.indexOf(monitoredCities[i]) >= 0 || monitoredCities[i].indexOf(city) >= 0) {
+                            alertMatchCity = monitoredCities[i];
+                            alertTitle = title;
+                            alertDesc = desc;
+                            alertCat = c;
+                            cat = c;
+                            Serial.printf("Test inject MATCH cat=%d: %s -> %s\n", c, city.c_str(), alertMatchCity.c_str());
+                            break;
+                        }
+                    }
+                    if (cat > 0) break;
+                }
+                if (cat == 0) {
+                    Serial.printf("Test inject: no city match (cat=%d title=%s)\n", c, title.c_str());
+                }
+            }
         }
+    } else if (!testAlertOn && (now - lastPoll > POLL_MS)) {
+        // Normal mode: poll API on timer
+        lastPoll = now;
+        cat = pollAlerts();
+    }
 
-        if (cat > 0) {
-            // Classify by title first
-            AlertState newState = classifyAlert(alertTitle);
-            // Fallback by category number
-            if (newState == STATE_IDLE) {
-                if ((cat >= 1 && cat <= 7) || cat == 13) newState = STATE_SHELTER;
-                else if (cat == 10) newState = STATE_WARNING;
-            }
+    if (cat > 0) {
+        AlertState newState = classifyAlert(alertTitle);
+        if (newState == STATE_IDLE) {
+            if ((cat >= 1 && cat <= 7) || cat == 13) newState = STATE_SHELTER;
+            else if (cat == 10) newState = STATE_WARNING;
+        }
+        Serial.printf("Classified: cat=%d -> %s (current: %s)\n", cat, stateLabel(newState), stateLabel(alertState));
 
-            if (newState != STATE_IDLE && newState != alertState) {
-                addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
-                changeState(newState);
-            }
+        if (newState != STATE_IDLE && newState != alertState) {
+            addAlertLog(cat, alertTitle, alertDesc, alertMatchCity);
+            changeState(newState);
         }
     }
 
@@ -1278,7 +1396,6 @@ void loop() {
         oled.drawXBM(0, 0, 128, 64, bmp_lamiklat);
         oled.sendBuffer();
     } else if (alertState == STATE_WARNING) {
-        // Flash the bitmap on/off every 500ms
         if ((now / 500) % 2 == 0) {
             oled.clearBuffer();
             oled.drawXBM(0, 0, 128, 64, bmp_hatraa);
@@ -1295,7 +1412,6 @@ void loop() {
         oled.clearBuffer();
         oled.sendBuffer();
     } else {
-        // Normal idle: status / city list
         unsigned long now2 = millis();
         if (now2 - lastDisplaySwitch > 4000) {
             lastDisplaySwitch = now2;
@@ -1325,10 +1441,10 @@ void loop() {
         }
     }
 
-    // ===== 4. Sound: Mario tune for SHELTER (plays once ~5s), no sound for WARNING =====
+    // ===== 4. Sound: alarm for SHELTER (configurable), beep for CLEAR =====
     if (alertState == STATE_SHELTER && !sirenSilenced) {
-        if (sirenCount < MAX_SIREN_PLAYS) {
-            bool pressed = marioSiren();
+        if (sirenCount < cfgAlarmRepeats) {
+            bool pressed = playAlarm();
             if (pressed) {
                 sirenSilenced = true;
                 buzzOff();
@@ -1336,7 +1452,7 @@ void loop() {
                 delay(300);
             } else {
                 sirenCount++;
-                if (sirenCount >= MAX_SIREN_PLAYS) {
+                if (sirenCount >= cfgAlarmRepeats) {
                     sirenSilenced = true;
                 }
             }
