@@ -50,6 +50,8 @@ static const char* AREAS_CFG  = "/alert_areas.json";
 static const char* AREAS_REF  = "/areas.json";
 static const char* NAMES_FILE = "/area_names.json";
 static const char* SETTINGS_FILE = "/settings.json";
+static const char* FW_VERSION = "1.0";
+static const char* GIT_REPO = "https://github.com/dshohat/single_button";
 static const unsigned long POLL_MS = 3000;
 
 // ===== Globals =====
@@ -141,6 +143,30 @@ String nowStr() {
 static const char* LOG_FILE = "/alert_log.txt";
 bool nightMode = false;
 
+static const size_t MAX_LOG_SIZE = 8192;  // ~40-50 entries, then oldest are trimmed
+
+void trimLogFile() {
+    File f = LittleFS.open(LOG_FILE, "r");
+    if (!f) return;
+    if (f.size() <= MAX_LOG_SIZE) { f.close(); return; }
+    // Read all lines, keep the newest half
+    std::vector<String> lines;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() > 0) lines.push_back(line);
+    }
+    f.close();
+    int keep = lines.size() / 2;
+    File fw = LittleFS.open(LOG_FILE, "w");
+    if (!fw) return;
+    for (int i = lines.size() - keep; i < (int)lines.size(); i++) {
+        fw.println(lines[i]);
+    }
+    fw.close();
+    Serial.printf("Log trimmed: %d -> %d entries\n", lines.size(), keep);
+}
+
 void addAlertLog(int cat, const String& title, const String& desc, const String& city) {
     String ts = nowStr();
     Serial.printf("[%s] addAlertLog: cat=%d city=%s\n", ts.c_str(), cat, city.c_str());
@@ -155,6 +181,7 @@ void addAlertLog(int cat, const String& title, const String& desc, const String&
     serializeJson(doc, f);
     f.println();
     f.close();
+    trimLogFile();
 }
 
 // ===== Display helpers =====
@@ -540,6 +567,11 @@ String stateHTML() {
 
 static const char NAV[] = R"rawliteral(<nav><a href="/">Home</a><a href="/wifi">WiFi</a><a href="/areas">Areas</a><a href="/settings">Settings</a><a href="/log">Log</a><a href="/test_page">Test</a></nav><hr>)rawliteral";
 
+String htmlFooter() {
+    return "<hr><p style=\"text-align:center;color:#666;font-size:12px\">v" + String(FW_VERSION)
+        + " | <a href=\"" + String(GIT_REPO) + "\" target=\"_blank\" style=\"color:#666\">GitHub</a></p>";
+}
+
 String htmlHead(const char* title) {
     return String("<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
@@ -569,7 +601,7 @@ void handleHome() {
         + "<p>Status: <b>" + (testAlertOn ? "<span style=\"color:#ff9800\">TEST MODE</span>" : (tlsOK ? "Online" : "Offline")) + "</b></p>"
         + "<p>Display: <b>" + (nightMode ? "Night" : "Day") + "</b></p>"
         + "<form method=\"POST\" action=\"/night\">" + nightBtn + "</form></div>"
-        + "</body></html>";
+        + htmlFooter() + "</body></html>";
     srv.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -598,7 +630,7 @@ void handleWifi() {
         + "<label>SSID:</label><input type=\"text\" name=\"ssid\" style=\"width:100%\"><br>"
         + "<label>Password:</label><input type=\"password\" name=\"password\" style=\"width:100%\"><br><br>"
         + "<button type=\"submit\">Add Network</button>"
-        + "</form></div></body></html>";
+        + "</form></div>" + htmlFooter() + "</body></html>";
     srv.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -664,7 +696,8 @@ void handleAreas() {
 
     srv.sendContent("</div><div class=\"card\"><form method=\"POST\" action=\"/clear_areas\">"
         "<button style=\"background:#555\" type=\"submit\">Clear All Areas</button>"
-        "</form></div></body></html>");
+        "</form></div>");
+    srv.sendContent(htmlFooter() + "</body></html>");
     srv.sendContent("");
 }
 
@@ -714,7 +747,7 @@ void handleAreaDetail() {
         "<input type=\"hidden\" name=\"area\" value=\"" + areaName + "\">"
         "<button style=\"background:#555\" type=\"submit\">Turn Off</button>"
         "</form></div>"
-        "<p><a href=\"/areas\">Back</a></p></body></html>");
+        "<p><a href=\"/areas\">Back</a></p>" + htmlFooter() + "</body></html>");
     srv.sendContent("");
 }
 
@@ -786,7 +819,7 @@ void handleSettings() {
         + "<label class=\"item\"><input type=\"checkbox\" name=\"defaultNight\" value=\"1\"" + nightChecked + "> Start in Night Mode on power-on</label>"
         + "</div>"
         + "<button type=\"submit\">Save Settings</button>"
-        + "</form></body></html>";
+        + "</form>" + htmlFooter() + "</body></html>";
     srv.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -850,19 +883,19 @@ void handleLog() {
         "<div class=\"card\" style=\"text-align:center\">"
         "<a href=\"https://www.oref.org.il/heb/alerts-history\" target=\"_blank\" "
         "style=\"font-size:18px\">\xD7\x94\xD7\x99\xD7\xA1\xD7\x98\xD7\x95\xD7\xA8\xD7\x99\xD7\x99\xD7\xAA "
-        "\xD7\x94\xD7\xAA\xD7\xA8\xD7\x90\xD7\x95\xD7\xAA</a></div>"
-        "</body></html>");
+        "\xD7\x94\xD7\xAA\xD7\xA8\xD7\x90\xD7\x95\xD7\xAA</a></div>");
+    srv.sendContent(htmlFooter() + "</body></html>");
     srv.sendContent("");
 }
 
 void handleLogDownload() {
     if (!LittleFS.exists(LOG_FILE)) {
-        srv.send(200, "text/plain", "(empty)");
+        srv.send(200, "text/plain; charset=utf-8", "(empty)");
         return;
     }
     File f = LittleFS.open(LOG_FILE, "r");
-    if (!f) { srv.send(200, "text/plain", "(empty)"); return; }
-    srv.streamFile(f, "text/plain");
+    if (!f) { srv.send(200, "text/plain; charset=utf-8", "(empty)"); return; }
+    srv.streamFile(f, "text/plain; charset=utf-8");
     f.close();
 }
 
@@ -907,7 +940,7 @@ void handleTestPage() {
         + "</div>"
         + "<div class=\"card\"><form action=\"/reset_all\" method=\"POST\">"
         + "<button style=\"background:#c0392b\">Factory Reset</button>"
-        + "</form></div></body></html>";
+        + "</form></div>" + htmlFooter() + "</body></html>";
     srv.send(200, "text/html; charset=utf-8", html);
 }
 
@@ -955,8 +988,10 @@ void handleTestQuick() {
         newState = STATE_WARNING;
     }
     alertMatchCity = city;
-    changeState(newState);
-    addAlertLog(alertCat, alertTitle, alertDesc, alertMatchCity);
+    if (newState != alertState) {
+        changeState(newState);
+        addAlertLog(alertCat, alertTitle, alertDesc, alertMatchCity);
+    }
     sendRedirect("/test_page");
 }
 
@@ -973,6 +1008,19 @@ void handleTestInject() {
     testHasInjection = true;
     Serial.println("Test inject: " + testInjectedBody);
     srv.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiCities() {
+    JsonDocument doc;
+    JsonArray arr = doc["cities"].to<JsonArray>();
+    for (const auto& c : monitoredCities) {
+        arr.add(c);
+    }
+    doc["test_mode"] = testAlertOn;
+    String json;
+    serializeJson(doc, json);
+    srv.sendHeader("Access-Control-Allow-Origin", "*");
+    srv.send(200, "application/json", json);
 }
 
 void handleResetAll() {
@@ -1298,6 +1346,7 @@ void setup() {
     srv.on("/test_quick", HTTP_POST, handleTestQuick);
     srv.on("/test_inject", HTTP_POST, handleTestInject);
     srv.on("/clear_test", HTTP_POST, handleClearTest);
+    srv.on("/api/cities", handleApiCities);
     srv.on("/reset_all", HTTP_POST, handleResetAll);
     srv.on("/favicon.ico", []() { srv.send(204); });
     srv.begin();
@@ -1384,7 +1433,7 @@ void loop() {
 
     // ===== 2. Auto-clear CLEAR state after 60 seconds =====
     if (alertState == STATE_CLEAR) {
-        if (now - stateChangedAt > CLEAR_TIMEOUT_MS) {
+        if (millis() - stateChangedAt > CLEAR_TIMEOUT_MS) {
             Serial.println("CLEAR expired -> IDLE");
             clearAlertState();
         }

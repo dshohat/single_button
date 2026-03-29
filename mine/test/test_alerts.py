@@ -4,6 +4,10 @@ Test Alert Injector for ESP32 Emergency Alert System
 Sends realistic Pikud HaOref-format JSON to the ESP32's /test_inject endpoint.
 The device must be in Test Mode (enable via web UI -> Test page).
 
+The script fetches the device's monitored cities via /api/cities and uses
+them in test payloads, so alerts go through the exact same city-matching
+pipeline as real alerts from oref.org.il.
+
 Usage:
     python test_alerts.py <ESP32_IP>
     python test_alerts.py 192.168.1.100
@@ -12,6 +16,7 @@ Usage:
 import sys
 import json
 import os
+import time
 import urllib.request
 
 # Bypass proxy for local ESP32 connections
@@ -23,28 +28,51 @@ urllib.request.install_opener(
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 AREAS_FILE = os.path.join(SCRIPT_DIR, "..", "arduino", "data", "areas.json")
 
+# ---- Real Pikud HaOref alert templates (exact titles & descriptions) ----
+
 ALERT_TYPES = [
-    {"cat": 1,  "title": "\u05d9\u05e8\u05d9 \u05e8\u05e7\u05d8\u05d5\u05ea \u05d5\u05d8\u05d9\u05dc\u05d9\u05dd",
-     "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df \u05d5\u05e9\u05d4\u05d5 \u05d1\u05d5 10 \u05d3\u05e7\u05d5\u05ea",
-     "label": "Missiles (cat 1) - SIREN"},
-    {"cat": 3,  "title": "\u05e8\u05e2\u05d9\u05d3\u05ea \u05d0\u05d3\u05de\u05d4",
-     "desc": "\u05e6\u05d0\u05d5 \u05de\u05d4\u05de\u05d1\u05e0\u05d9\u05dd \u05dc\u05e9\u05d8\u05d7 \u05e4\u05ea\u05d5\u05d7",
-     "label": "Earthquake (cat 3) - SIREN"},
-    {"cat": 6,  "title": "\u05d7\u05d3\u05d9\u05e8\u05ea \u05db\u05dc\u05d9 \u05d8\u05d9\u05e1 \u05e2\u05d5\u05d9\u05d9\u05df",
-     "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
-     "label": "Hostile aircraft (cat 6) - SIREN"},
-    {"cat": 7,  "title": "\u05d7\u05d5\u05de\u05e8\u05d9\u05dd \u05de\u05e1\u05d5\u05db\u05e0\u05d9\u05dd",
-     "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
-     "label": "Hazardous materials (cat 7) - SIREN"},
-    {"cat": 13, "title": "\u05d7\u05d3\u05d9\u05e8\u05ea \u05de\u05d7\u05d1\u05dc\u05d9\u05dd",
-     "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05de\u05d5\u05d2\u05df \u05d5\u05e0\u05e2\u05dc\u05d5 \u05d0\u05ea \u05d4\u05d3\u05dc\u05ea",
-     "label": "Terrorist infiltration (cat 13) - SIREN"},
-    {"cat": 10, "title": "\u05d4\u05ea\u05e8\u05d0\u05d4 \u05de\u05d5\u05e7\u05d3\u05de\u05ea",
-     "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
-     "label": "NewsFlash early warning (cat 10) - FLASH"},
-    {"cat": 10, "title": "\u05d4\u05d0\u05d9\u05e8\u05d5\u05e2 \u05d4\u05e1\u05ea\u05d9\u05d9\u05dd",
-     "desc": "\u05e0\u05d9\u05ea\u05df \u05dc\u05e6\u05d0\u05ea \u05de\u05d4\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
-     "label": "Exit shelter / event ended (cat 10) - CLEAR"},
+    {
+        "cat": 1,
+        "title": "\u05d9\u05e8\u05d9 \u05e8\u05e7\u05d8\u05d5\u05ea \u05d5\u05d8\u05d9\u05dc\u05d9\u05dd",
+        "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
+        "label": "Missiles (cat 1) \u2192 SHELTER",
+    },
+    {
+        "cat": 3,
+        "title": "\u05e8\u05e2\u05d9\u05d3\u05ea \u05d0\u05d3\u05de\u05d4",
+        "desc": "\u05e6\u05d0\u05d5 \u05de\u05d4\u05de\u05d1\u05e0\u05d9\u05dd \u05dc\u05e9\u05d8\u05d7 \u05e4\u05ea\u05d5\u05d7",
+        "label": "Earthquake (cat 3) \u2192 SHELTER",
+    },
+    {
+        "cat": 6,
+        "title": "\u05d7\u05d3\u05d9\u05e8\u05ea \u05db\u05dc\u05d9 \u05d8\u05d9\u05e1 \u05e2\u05d5\u05d9\u05d9\u05df",
+        "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
+        "label": "Hostile aircraft (cat 6) \u2192 SHELTER",
+    },
+    {
+        "cat": 7,
+        "title": "\u05d7\u05d5\u05de\u05e8\u05d9\u05dd \u05de\u05e1\u05d5\u05db\u05e0\u05d9\u05dd",
+        "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
+        "label": "Hazardous materials (cat 7) \u2192 SHELTER",
+    },
+    {
+        "cat": 13,
+        "title": "\u05d7\u05d3\u05d9\u05e8\u05ea \u05de\u05d7\u05d1\u05dc\u05d9\u05dd",
+        "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05de\u05d5\u05d2\u05df \u05d5\u05e0\u05e2\u05dc\u05d5 \u05d0\u05ea \u05d4\u05d3\u05dc\u05ea",
+        "label": "Terrorist infiltration (cat 13) \u2192 SHELTER",
+    },
+    {
+        "cat": 10,
+        "title": "\u05d1\u05d3\u05e7\u05d5\u05ea \u05d4\u05e7\u05e8\u05d5\u05d1\u05d5\u05ea \u05e6\u05e4\u05d5\u05d9\u05d5\u05ea \u05dc\u05d4\u05ea\u05e7\u05d1\u05dc \u05d4\u05ea\u05e8\u05e2\u05d5\u05ea \u05d1\u05d0\u05d6\u05d5\u05e8\u05da",
+        "desc": "\u05e2\u05dc \u05ea\u05d5\u05e9\u05d1\u05d9 \u05d4\u05d0\u05d6\u05d5\u05e8\u05d9\u05dd \u05d4\u05d1\u05d0\u05d9\u05dd \u05dc\u05e9\u05e4\u05e8 \u05d0\u05ea \u05d4\u05de\u05d9\u05e7\u05d5\u05dd \u05dc\u05de\u05d9\u05d2\u05d5\u05df \u05d4\u05de\u05d9\u05d8\u05d1\u05d9 \u05d1\u05e7\u05e8\u05d1\u05ea\u05da. \u05d1\u05de\u05e7\u05e8\u05d4 \u05e9\u05dc \u05e7\u05d1\u05dc\u05ea \u05d4\u05ea\u05e8\u05e2\u05d4, \u05d9\u05e9 \u05dc\u05d4\u05d9\u05db\u05e0\u05e1 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df \u05d5\u05dc\u05e9\u05d4\u05d5\u05ea \u05d1\u05d5 \u05e2\u05d3 \u05dc\u05d4\u05d5\u05d3\u05e2\u05d4 \u05d7\u05d3\u05e9\u05d4.",
+        "label": "Early warning (cat 10) \u2192 WARNING",
+    },
+    {
+        "cat": 10,
+        "title": "\u05d4\u05d0\u05d9\u05e8\u05d5\u05e2 \u05d4\u05e1\u05ea\u05d9\u05d9\u05dd",
+        "desc": "\u05d4\u05e9\u05d5\u05d4\u05d9\u05dd \u05d1\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df \u05d9\u05db\u05d5\u05dc\u05d9\u05dd \u05dc\u05e6\u05d0\u05ea. \u05d1\u05e2\u05ea \u05e7\u05d1\u05dc\u05ea \u05d4\u05e0\u05d7\u05d9\u05d4 \u05d0\u05d5 \u05d4\u05ea\u05e8\u05e2\u05d4, \u05d9\u05e9 \u05dc\u05e4\u05e2\u05d5\u05dc \u05d1\u05d4\u05ea\u05d0\u05dd \u05dc\u05d4\u05e0\u05d7\u05d9\u05d5\u05ea \u05e4\u05d9\u05e7\u05d5\u05d3 \u05d4\u05e2\u05d5\u05e8\u05e3.",
+        "label": "Event ended (cat 10) \u2192 CLEAR",
+    },
 ]
 
 
@@ -57,6 +85,21 @@ def load_areas():
     except Exception as e:
         print(f"Warning: Could not load {AREAS_FILE}: {e}")
         return {}
+
+
+def fetch_monitored_cities(ip):
+    """Fetch the device's monitored cities via /api/cities."""
+    url = f"http://{ip}/api/cities"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            cities = data.get("cities", [])
+            test_mode = data.get("test_mode", False)
+            return cities, test_mode
+    except Exception as e:
+        print(f"Warning: Could not fetch cities from device: {e}")
+        return [], False
 
 
 def send_alert(ip, payload):
@@ -120,7 +163,7 @@ def pick_from_list(items, prompt, allow_back=True):
         print("Invalid choice, try again")
 
 
-def build_custom_alert(areas_data):
+def build_custom_alert(areas_data, monitored_cities):
     """Interactive flow: pick area -> city -> alert type -> send."""
     area_names = sorted(areas_data.keys())
     if not area_names:
@@ -142,6 +185,15 @@ def build_custom_alert(areas_data):
     city = cities[idx]
     print(f"  Selected city: {city}")
 
+    # Warn if city is not monitored
+    if city not in monitored_cities:
+        print(f"\n  \u26a0  WARNING: '{city}' is NOT in the device's monitored cities!")
+        print(f"     Monitored: {monitored_cities}")
+        print(f"     The device should correctly IGNORE this alert.")
+        ans = input("     Send anyway? (y/n): ").strip().lower()
+        if ans != "y":
+            return None
+
     # Step 3: Pick alert type
     labels = [at["label"] for at in ALERT_TYPES]
     idx = pick_from_list(labels, "Choose alert type")
@@ -152,13 +204,25 @@ def build_custom_alert(areas_data):
 
     # Build payload
     payload = {
-        "id": str(int(__import__("time").time() * 10000000)),
+        "id": str(int(time.time() * 10000000)),
         "cat": at["cat"],
         "title": at["title"],
         "data": [city],
         "desc": at["desc"],
     }
     return payload
+
+
+def build_quick_payload(alert_type_idx, city):
+    """Build a payload using the given ALERT_TYPES index and city."""
+    at = ALERT_TYPES[alert_type_idx]
+    return {
+        "id": str(int(time.time() * 10000000)),
+        "cat": at["cat"],
+        "title": at["title"],
+        "data": [city],
+        "desc": at["desc"],
+    }
 
 
 def main():
@@ -172,21 +236,40 @@ def main():
 
     print(f"ESP32 Alert Test Injector")
     print(f"Target: {ip}")
+
+    # Fetch monitored cities from device
+    monitored_cities, test_mode = fetch_monitored_cities(ip)
+    if monitored_cities:
+        print(f"Monitored cities: {', '.join(monitored_cities)}")
+    else:
+        print("WARNING: Could not fetch monitored cities from device!")
+    if not test_mode:
+        print("\u26a0  Device is NOT in Test Mode! Enable it via web UI -> Test -> Enter Inject Mode")
+
     if areas_data:
-        print(f"Loaded {len(areas_data)} areas with cities")
-    print(f"Make sure the device is in Test Mode first!\n")
+        print(f"Loaded {len(areas_data)} areas from areas.json")
+    print()
+
+    # Default city for quick options = first monitored city
+    default_city = monitored_cities[0] if monitored_cities else None
 
     while True:
-        print("=" * 55)
+        print("=" * 60)
+        if default_city:
+            print(f"Quick alerts target: {default_city}")
         print("Main menu:\n")
-        print("  1. Custom alert (choose area -> city -> alert type)")
-        print("  2. Quick: Missiles in Tel Aviv (cat 1)")
-        print("  3. Quick: Earthquake in Jerusalem (cat 3)")
-        print("  4. Quick: Hostile aircraft in Haifa (cat 6)")
-        print("  5. Quick: Terrorist infiltration in Sderot (cat 13)")
-        print("  6. NewsFlash early warning (cat 10)")
-        print("  7. NewsFlash event ended (\u05d4\u05e1\u05ea\u05d9\u05d9\u05dd) - back to normal")
-        print("  8. Clear alert (empty) - back to normal")
+        print("  1. Custom alert (choose area \u2192 city \u2192 alert type)")
+        if default_city:
+            print(f"  2. Missiles \u2192 SHELTER          ({default_city})")
+            print(f"  3. Earthquake \u2192 SHELTER         ({default_city})")
+            print(f"  4. Hostile aircraft \u2192 SHELTER    ({default_city})")
+            print(f"  5. Terrorist attack \u2192 SHELTER   ({default_city})")
+            print(f"  6. Early warning \u2192 WARNING      ({default_city})")
+            print(f"  7. Event ended \u2192 CLEAR          ({default_city})")
+        else:
+            print("  2-7. (unavailable \u2014 no monitored cities found)")
+        print("  8. Clear alert (empty payload) \u2192 IDLE")
+        print("  9. Full scenario: WARNING \u2192 SHELTER \u2192 CLEAR (auto)")
         print("\n  0. Exit\n")
 
         choice = input("Enter choice: ").strip()
@@ -197,60 +280,36 @@ def main():
         payload = None
 
         if choice == "1":
-            payload = build_custom_alert(areas_data)
+            payload = build_custom_alert(areas_data, monitored_cities)
             if payload is None:
                 continue
 
-        elif choice == "2":
-            payload = {
-                "id": str(int(__import__("time").time() * 10000000)),
-                "cat": 1,
-                "title": "\u05d9\u05e8\u05d9 \u05e8\u05e7\u05d8\u05d5\u05ea \u05d5\u05d8\u05d9\u05dc\u05d9\u05dd",
-                "data": ["\u05ea\u05dc \u05d0\u05d1\u05d9\u05d1 - \u05de\u05e8\u05db\u05d6 \u05d4\u05e2\u05d9\u05e8"],
-                "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df \u05d5\u05e9\u05d4\u05d5 \u05d1\u05d5 10 \u05d3\u05e7\u05d5\u05ea",
-            }
-        elif choice == "3":
-            payload = {
-                "id": str(int(__import__("time").time() * 10000000)),
-                "cat": 3,
-                "title": "\u05e8\u05e2\u05d9\u05d3\u05ea \u05d0\u05d3\u05de\u05d4",
-                "data": ["\u05d9\u05e8\u05d5\u05e9\u05dc\u05d9\u05dd - \u05de\u05e8\u05db\u05d6"],
-                "desc": "\u05e6\u05d0\u05d5 \u05de\u05d4\u05de\u05d1\u05e0\u05d9\u05dd \u05dc\u05e9\u05d8\u05d7 \u05e4\u05ea\u05d5\u05d7",
-            }
-        elif choice == "4":
-            payload = {
-                "id": str(int(__import__("time").time() * 10000000)),
-                "cat": 6,
-                "title": "\u05d7\u05d3\u05d9\u05e8\u05ea \u05db\u05dc\u05d9 \u05d8\u05d9\u05e1 \u05e2\u05d5\u05d9\u05d9\u05df",
-                "data": ["\u05d7\u05d9\u05e4\u05d4 - \u05db\u05e8\u05de\u05dc \u05d5\u05e2\u05d9\u05e8 \u05ea\u05d7\u05ea\u05d9\u05ea"],
-                "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
-            }
-        elif choice == "5":
-            payload = {
-                "id": str(int(__import__("time").time() * 10000000)),
-                "cat": 13,
-                "title": "\u05d7\u05d3\u05d9\u05e8\u05ea \u05de\u05d7\u05d1\u05dc\u05d9\u05dd",
-                "data": ["\u05e9\u05d3\u05e8\u05d5\u05ea, \u05d0\u05d9\u05d1\u05d9\u05dd, \u05e0\u05d9\u05e8 \u05e2\u05dd"],
-                "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05de\u05d5\u05d2\u05df \u05d5\u05e0\u05e2\u05dc\u05d5 \u05d0\u05ea \u05d4\u05d3\u05dc\u05ea",
-            }
-        elif choice == "6":
-            payload = {
-                "id": str(int(__import__("time").time() * 10000000)),
-                "cat": 10,
-                "title": "\u05d4\u05ea\u05e8\u05d0\u05d4 \u05de\u05d5\u05e7\u05d3\u05de\u05ea",
-                "data": ["\u05d2\u05d5\u05e9 \u05d3\u05df"],
-                "desc": "\u05d4\u05d9\u05db\u05e0\u05e1\u05d5 \u05dc\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
-            }
-        elif choice == "7":
-            payload = {
-                "id": str(int(__import__("time").time() * 10000000)),
-                "cat": 10,
-                "title": "\u05d4\u05d0\u05d9\u05e8\u05d5\u05e2 \u05d4\u05e1\u05ea\u05d9\u05d9\u05dd",
-                "data": ["\u05d2\u05d5\u05e9 \u05d3\u05df"],
-                "desc": "\u05e0\u05d9\u05ea\u05df \u05dc\u05e6\u05d0\u05ea \u05de\u05d4\u05de\u05e8\u05d7\u05d1 \u05d4\u05de\u05d5\u05d2\u05df",
-            }
+        elif choice in ("2", "3", "4", "5", "6", "7") and default_city:
+            # Map choices to ALERT_TYPES indices:
+            # 2=missiles(0), 3=earthquake(1), 4=aircraft(2),
+            # 5=hazmat... wait, let me use correct mapping
+            type_map = {"2": 0, "3": 1, "4": 2, "5": 4, "6": 5, "7": 6}
+            payload = build_quick_payload(type_map[choice], default_city)
+
         elif choice == "8":
             payload = {}
+
+        elif choice == "9" and default_city:
+            # Full realistic scenario: WARNING -> wait -> SHELTER -> wait -> CLEAR
+            print(f"\n  Running full scenario for {default_city}...")
+            print(f"  Step 1/3: Early warning (WARNING)")
+            send_alert(ip, build_quick_payload(5, default_city))
+            print(f"  Waiting 8 seconds...")
+            time.sleep(8)
+            print(f"  Step 2/3: Missiles (SHELTER)")
+            send_alert(ip, build_quick_payload(0, default_city))
+            print(f"  Waiting 15 seconds...")
+            time.sleep(15)
+            print(f"  Step 3/3: Event ended (CLEAR)")
+            send_alert(ip, build_quick_payload(6, default_city))
+            print(f"  Scenario complete!\n")
+            continue
+
         else:
             print("Invalid choice\n")
             continue

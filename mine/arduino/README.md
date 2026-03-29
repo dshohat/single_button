@@ -1,4 +1,6 @@
-# Emergency Alert System — Arduino/PlatformIO
+# Emergency Alert System v1.0 — Arduino/PlatformIO
+
+[![GitHub](https://img.shields.io/badge/GitHub-dshohat%2Fsingle__button-blue)](https://github.com/dshohat/single_button)
 
 Real-time emergency alert system for ESP32 that connects to the Israeli Home Front Command (Pikud HaOref) Red Alert API. Displays alerts on an OLED screen with Hebrew text, sounds an audible alarm, and provides a web-based configuration UI.
 
@@ -10,6 +12,7 @@ Real-time emergency alert system for ESP32 that connects to the Israeli Home Fro
 - **Mario-style alarm** — audible "E-LA-mama" tune on SHELTER alerts (plays once, interruptible by button)
 - **WARNING = flash only** — OLED flashes the warning bitmap, no sound
 - **CLEAR auto-expires** — returns to IDLE after 60 seconds
+- **Auto-trimmed alert log** — capped at 8KB, oldest entries removed automatically
 - **Web UI** — configure WiFi, select monitored areas/cities, view alert log, run tests
 - **Test injection** — send test alerts from your laptop using `test_alerts.py`
 - **Night mode** — turn off the display via web UI
@@ -44,17 +47,18 @@ Real-time emergency alert system for ESP32 that connects to the Israeli Home Fro
 
 #### 1. Open the project
 
-- In VS Code, go to **File → Open Folder**
-- Navigate to and select the `mine/arduino` folder
-- PlatformIO will automatically detect `platformio.ini` and configure the project
+- In VS Code, go to **File → Open Workspace from File**
+- Navigate to `mine/arduino` and select **`single_button.code-workspace`**
+- This opens both the main repo and the `arduino` folder, so PlatformIO detects `platformio.ini` and shows the project in the sidebar
+- Alternatively, open just the `mine/arduino` folder directly (**File → Open Folder**)
 
 #### 2. Set your COM port
 
 - Open `platformio.ini`
 - Change `upload_port` and `monitor_port` to match your ESP32's COM port:
   ```ini
-  upload_port = COM5      ; ← change to your port
-  monitor_port = COM5     ; ← change to your port
+  upload_port = COM3      ; ← change to your port
+  monitor_port = COM3     ; ← change to your port
   ```
 - To find your port: open Device Manager → Ports (COM & LPT) → look for the Silicon Labs entry
 
@@ -125,22 +129,24 @@ The ESP32 needs area/city data on its LittleFS filesystem. Upload it once:
    cd mine/test
    python test_alerts.py <device-ip>
    ```
-3. Use the interactive menu to send realistic alert payloads
-4. When done, click **End Inject Mode** on the test page
+3. The script auto-fetches your monitored cities and uses them in alerts
+4. Use the interactive menu to send realistic alert payloads
+5. Option **9** runs a full WARNING → SHELTER → CLEAR scenario automatically
+6. When done, click **End Inject Mode** on the test page
 
 ## Project Structure
 
 ```
 arduino/
-├── platformio.ini          # PlatformIO build configuration
+├── platformio.ini                  # PlatformIO build configuration
+├── single_button.code-workspace    # VS Code multi-root workspace
+├── gen_bitmaps.py                  # Generate Hebrew XBM bitmaps (run on PC)
 ├── data/
-│   ├── areas.json          # Master list of areas → cities
-│   └── area_names.json     # Area name list
-├── src/
-│   ├── main.cpp            # Main firmware source
-│   └── hebrew_bitmaps.h    # Pre-rendered Hebrew XBM bitmaps for OLED
-└── lib/
-    └── U8g2/               # OLED display library (local copy)
+│   ├── areas.json                  # Master list of areas → cities
+│   └── area_names.json             # Area name list
+└── src/
+    ├── main.cpp                    # Main firmware source
+    └── hebrew_bitmaps.h            # Pre-rendered Hebrew XBM bitmaps for OLED
 ```
 
 ## LittleFS Files (on-device)
@@ -151,4 +157,4 @@ arduino/
 | `/alert_areas.json` | Selected areas/cities to monitor |
 | `/areas.json` | Master area→cities reference (uploaded from `data/`) |
 | `/area_names.json` | Area name list (uploaded from `data/`) |
-| `/alert_log.txt` | Alert history log |
+| `/alert_log.txt` | Alert history log (auto-trimmed to 8KB) |
